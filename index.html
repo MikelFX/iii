@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>IMCO Sklad</title>
+<meta name="theme-color" content="#1f6feb">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon.svg">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <button class="iconbtn" id="menuBtn" aria-label="Menu">☰</button>
+  <h1 id="pageTitle">Přehled</h1>
+  <button class="iconbtn" id="quickScanBtn" aria-label="Rychlé skenování" title="Rychlé skenování">📷</button>
+</header>
+
+<nav class="sidenav" id="sidenav">
+  <div class="brand">IMCO Sklad</div>
+  <a href="#/" data-route="/">🏠 Přehled</a>
+  <a href="#/objednavky" data-route="/objednavky">🧾 Objednávky <span class="navbadge" id="navOrders"></span></a>
+  <a href="#/produkty" data-route="/produkty">📦 Produkty</a>
+  <a href="#/prijem" data-route="/prijem">⬇️ Příjem</a>
+  <a href="#/vydej" data-route="/vydej">⬆️ Výdej</a>
+  <a href="#/inventura" data-route="/inventura">📋 Inventura</a>
+  <a href="#/historie" data-route="/historie">🕘 Historie</a>
+  <a href="#/nastaveni" data-route="/nastaveni">⚙️ Nastavení</a>
+  <div class="grow"></div>
+  <div class="muted small" id="navUser" style="padding:10px 12px"></div>
+</nav>
+<div class="backdrop" id="backdrop"></div>
+
+<main id="view" class="view"></main>
+
+<nav class="tabbar">
+  <a href="#/" data-route="/"><span>🏠</span>Přehled</a>
+  <a href="#/objednavky" data-route="/objednavky" style="position:relative"><span>🧾</span>Objednávky<span class="tabbadge" id="tabOrders"></span></a>
+  <a href="#/prijem" data-route="/prijem"><span>⬇️</span>Příjem</a>
+  <a href="#/produkty" data-route="/produkty"><span>📦</span>Produkty</a>
+  <a href="#" id="tabMore"><span>☰</span>Více</a>
+</nav>
+
+<!-- Scanner overlay -->
+<div class="modal hidden" id="scanModal">
+  <div class="modal-card scan-card">
+    <div class="modal-head">
+      <strong id="scanTitle">Skenování</strong>
+      <button class="iconbtn" id="scanClose">✕</button>
+    </div>
+    <div id="reader"></div>
+    <div class="scan-manual">
+      <input id="scanManual" inputmode="text" placeholder="…nebo zadej kód ručně" autocomplete="off">
+      <button class="btn" id="scanManualBtn">OK</button>
+    </div>
+    <div class="scan-last" id="scanLast"></div>
+  </div>
+</div>
+
+<!-- Červená obrazovka: naskenováno jiné zboží -->
+<div class="errscreen hidden" id="errScreen">
+  <div class="errscreen-inner">
+    <div class="errscreen-x">✖</div>
+    <h2 id="errTitle">ŠPATNÝ PRODUKT</h2>
+    <div class="errscreen-detail" id="errDetail"></div>
+    <p>Vrať zboží zpět na jeho místo v regálu a potvrď.</p>
+    <button class="btn big" id="errReturn">↩ Vrátit zboží zpět na místo</button>
+  </div>
+</div>
+
+<!-- Generic dialog -->
+<div class="modal hidden" id="dlg">
+  <div class="modal-card" id="dlgCard"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="vendor/html5-qrcode.min.js"></script>
+<script src="vendor/supabase.js"></script>
+<script src="vendor/jsbarcode.all.min.js"></script>
+<script src="db.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

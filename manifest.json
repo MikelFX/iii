@@ -1,0 +1,14 @@
+{
+  "name": "IMCO Sklad",
+  "short_name": "Sklad",
+  "description": "Skladový systém se čtečkou čárových kódů",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f4f6fa",
+  "theme_color": "#1f6feb",
+  "lang": "cs",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
