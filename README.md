@@ -4,6 +4,10 @@ Skladový systém se čtečkou čárových kódů. Jedna aplikace pro mobil i po
 
 ## Spuštění
 
+Aplikace běží na **https://mikelfx.github.io/iii/** (GitHub Pages, nasazuje se automaticky z větve `main`). Na mobilu otevři adresu v prohlížeči a zvol „Přidat na plochu“.
+
+Lokálně:
+
 Stačí jakýkoli statický webserver (kamera v prohlížeči vyžaduje HTTPS nebo `localhost`):
 
 ```bash
