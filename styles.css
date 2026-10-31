@@ -250,7 +250,7 @@ tr.clickable:hover { background: var(--bg); }
 .label-items { margin: 8px 0 0; padding-left: 18px; font-size: 12px; }
 @media print {
   body { background: #fff; }
-  .topbar, .sidenav, .tabbar, .no-print, .toast, .backdrop, .modal { display: none !important; }
+  .topbar, .sidenav, .tabbar, .no-print, .toast, .backdrop, .modal, .updbar { display: none !important; }
   .view { margin: 0 !important; padding: 0 !important; max-width: none; }
   .label { border: none; }
   @page { margin: 6mm; }
@@ -296,3 +296,8 @@ tr.clickable:hover { background: var(--bg); }
   .inv-table th { background: #eee; }
 }
 .label-date strong { color: #000; font-size: 13px; }
+
+/* Lišta „nová verze aplikace“ */
+.updbar { position: sticky; top: 60px; z-index: 19; display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; padding: 8px 12px; background: var(--primary); color: #fff; font-weight: 600; }
+.updbar .btn { background: #fff; color: var(--primary); }
+.updbar.hidden { display: none; }

@@ -15,6 +15,7 @@
   const ORDER_STATUS = { new: 'Nová', preparing: 'Připravuje se', ready: 'Připraveno', done: 'Vydáno', cancelled: 'Zrušeno' };
   const TYPE_BADGE = { receipt: 'ok', issue: 'warn', inventory: 'neutral', adjust: 'neutral', transfer: 'neutral' };
   const UNITS = ['ks', 'kg', 'g', 'l', 'ml', 'bal', 'krt', 'pal', 'm'];
+  const APP_VERSION = '0.3.1';
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -1344,7 +1345,8 @@
       <div class="card"><h2>Nebezpečná zóna</h2>
         <div class="row"><button class="btn danger" id="wipe">Smazat všechna data</button><button class="btn secondary" id="demo">Nahrát ukázková data</button></div>
       </div>
-      <p class="muted small">IMCO Sklad · ${state.products.length} produktů · ${state.movements.length} dokladů · ${state.orders.length} objednávek · verze 0.3</p>
+      <p class="muted small">IMCO Sklad · ${state.products.length} produktů · ${state.movements.length} dokladů · ${state.orders.length} objednávek · verze ${APP_VERSION}</p>
+      <div class="row" style="margin-bottom:14px"><button class="btn secondary" id="updCheck">🔄 Zkontrolovat aktualizaci</button><span class="muted small">Appka si novou verzi stahuje sama při otevření; tlačítko ji vynutí hned.</span></div>
       <input type="file" id="fileIn" hidden>`;
 
     $('#sbSave').onclick = async () => {
@@ -1361,6 +1363,7 @@
       await DB.importAll({ products, movements, orders }, { replace: false }); await loadAll(); toast('Nahráno'); render();
     };
     $('#setWh').onchange = (e) => { setWh(e.target.value); toast(`Zařízení pracuje ve skladu ${whName(e.target.value)}`); };
+    $('#updCheck').onclick = async () => { toast('Stahuji nejnovější verzi…'); try { if (swReg) await swReg.update(); } catch (_) {} setTimeout(() => location.reload(), 600); };
     $('#invSave').onclick = async () => {
       const inv = JSON.parse(JSON.stringify(state.settings.invoice || {}));
       $$('[data-inv]', el).forEach(i => { const [w, k] = i.dataset.inv.split('.'); inv[w] = inv[w] || {}; inv[w][k] = i.value.trim(); });
@@ -1466,6 +1469,14 @@
     });
   }
 
+  // ---------- Aktualizace aplikace (nová verze na serveru → lišta „Načíst“) ----------
+  let swReg = null;
+  function showUpdateBar() {
+    const bar = $('#updBar'); if (!bar || !bar.classList.contains('hidden')) return;
+    bar.classList.remove('hidden');
+    $('#updReload').onclick = () => location.reload();
+  }
+
   // ---------- Start ----------
   (async () => {
     try { const t = localStorage.getItem('theme'); if (t && t !== 'auto') document.documentElement.dataset.theme = t; } catch (_) {}
@@ -1487,6 +1498,14 @@
     }
     try { await loadAll(); } catch (err) { $('#view').innerHTML = `<div class="card"><h2>Nelze načíst data</h2><p>${esc(err.message)}</p><p class="muted small">Zkontroluj, že je v Supabase spuštěné <span class="mono">schema.sql</span>, nebo v Nastavení databázi odpoj.</p><a class="btn" href="#/nastaveni">Nastavení</a></div>`; }
     await render();
-    if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
+    if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+      navigator.serviceWorker.register('sw.js').then(reg => {
+        swReg = reg;
+        const watch = (w) => { if (!w) return; w.addEventListener('statechange', () => { if (w.state === 'activated' && navigator.serviceWorker.controller) showUpdateBar(); }); };
+        reg.addEventListener('updatefound', () => { if (reg.active) watch(reg.installing); }); // při úplně prvním načtení lištu neukazovat
+        // Nová verze se hledá při každém návratu do appky (mobil ji nechává běžet na pozadí).
+        document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+      }).catch(() => {});
+    }
   })();
 })();
