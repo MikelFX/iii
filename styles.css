@@ -301,3 +301,8 @@ tr.clickable:hover { background: var(--bg); }
 .updbar { position: sticky; top: 60px; z-index: 19; display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; padding: 8px 12px; background: var(--primary); color: #fff; font-weight: 600; }
 .updbar .btn { background: #fff; color: var(--primary); }
 .updbar.hidden { display: none; }
+
+/* Balení (kartony) u produktu a při skenu */
+.pack-row { gap: 6px; margin-bottom: 6px; }
+.pack-row input[type=number] { width: 84px; flex: none; text-align: right; }
+.pack-note { background: var(--ok-bg); color: var(--ok); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; font-weight: 600; }

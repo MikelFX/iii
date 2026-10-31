@@ -1,5 +1,5 @@
 /* Service worker: aplikace funguje offline (po prvním načtení). */
-const CACHE = 'imco-sklad-v5';
+const CACHE = 'imco-sklad-v6';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './db.js', './manifest.json', './icon.svg', './vendor/html5-qrcode.min.js', './vendor/supabase.js', './vendor/jsbarcode.all.min.js'];
 
 self.addEventListener('install', (e) => {
