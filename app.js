@@ -15,7 +15,7 @@
   const ORDER_STATUS = { new: 'Nová', preparing: 'Připravuje se', ready: 'Připraveno', done: 'Vydáno', cancelled: 'Zrušeno' };
   const TYPE_BADGE = { receipt: 'ok', issue: 'warn', inventory: 'neutral', adjust: 'neutral', transfer: 'neutral' };
   const UNITS = ['ks', 'kg', 'g', 'l', 'ml', 'bal', 'krt', 'pal', 'm'];
-  const APP_VERSION = '0.4.1';
+  const APP_VERSION = '0.5.0';
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -155,17 +155,53 @@
 
   // ---------- Šarže (datum výroby / trvanlivost), vážené zboží ----------
   const isWeighed = (p) => ['kg', 'g'].includes(p.unit);
-  const today = () => new Date().toISOString().slice(0, 10);
+  const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }; // místní datum (ne UTC)
   const fmtDay = (d) => d ? new Date(d + 'T00:00:00').toLocaleDateString('cs-CZ') : '';
   const daysTo = (d) => d ? Math.round((new Date(d + 'T00:00:00') - new Date(today() + 'T00:00:00')) / 86400000) : null;
-  const addDays = (d, n) => { const x = new Date(d + 'T00:00:00'); x.setDate(x.getDate() + n); return x.toISOString().slice(0, 10); };
+  const addDays = (d, n) => { const x = new Date(d + 'T00:00:00Z'); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); }; // počítá v UTC, jinak by v ČR vyšel o den dřív
   const expiryBadge = (useBy) => { const n = daysTo(useBy); if (n === null) return ''; if (n < 0) return '<span class="badge danger">prošlé</span>'; if (n <= 7) return `<span class="badge warn">${n === 0 ? 'dnes' : n + ' dní'}</span>`; return `<span class="badge ok">${n} dní</span>`; };
   /** Šarže seřazené tak, aby se nejdřív vydávalo zboží s nejkratší trvanlivostí (FEFO). */
   const sortedBatches = (p, wh = state.wh) => (p.batches || []).filter(b => !wh || b.wh === wh).slice().sort((a, b) => ((a.useBy || '9999') < (b.useBy || '9999') ? -1 : (a.useBy || '9999') > (b.useBy || '9999') ? 1 : (a.receivedAt || 0) - (b.receivedAt || 0)));
   function addBatch(p, b) { p.batches = p.batches || []; p.batches.push({ id: uid(), receivedAt: Date.now(), wh: state.wh, ...b }); }
-  function takeFromBatches(p, qty, wh) {
+  // ----- Výběr trvanlivosti (šarže) v objednávce -----
+  /** Šarže ve skladu seskupené podle trvanlivosti, v pořadí FEFO: [{ useBy: 'YYYY-MM-DD' | null, qty }]. */
+  const lotsOf = (p, wh) => {
+    const out = [];
+    for (const b of sortedBatches(p, wh)) { if (!(b.qty > 0)) continue; const key = b.useBy || null; let l = out.find(x => x.useBy === key); if (!l) { l = { useBy: key, qty: 0 }; out.push(l); } l.qty = round3(l.qty + b.qty); }
+    return out;
+  };
+  const sameLot = (a, b) => (a || null) === (b || null);
+  const lotLabel = (useBy) => useBy ? 'do ' + fmtDay(useBy) : 'bez data trvanlivosti';
+  const lotQtyOf = (p, wh, lot) => round3(lotsOf(p, wh).filter(l => sameLot(l.useBy, lot.useBy)).reduce((s, l) => s + l.qty, 0));
+  /** Hodnota <select> pro šarži: '' = automaticky (nejkratší trvanlivost), '-' = šarže bez data, jinak datum. */
+  const lotToVal = (lot) => lot ? (lot.useBy || '-') : '';
+  const lotFromVal = (v) => v === '' ? null : { useBy: v === '-' ? null : v };
+  /** <option> seznam pro výběr trvanlivosti: automaticky + každá šarže s dostupným množstvím. */
+  const lotOptions = (p, wh, lot, unit) => {
+    const lots = lotsOf(p, wh); const sel = lotToVal(lot);
+    const opts = [`<option value="">Automaticky – nejdřív ${lots.length ? lotLabel(lots[0].useBy) : '—'}</option>`,
+      ...lots.map(l => { const v = lotToVal({ useBy: l.useBy }); return `<option value="${esc(v)}" ${v === sel ? 'selected' : ''}>${lotLabel(l.useBy)} · ${fmtQty(l.qty)} ${esc(unit)}</option>`; })];
+    if (lot && !lots.some(l => sameLot(l.useBy, lot.useBy))) opts.push(`<option value="${esc(sel)}" selected>${lotLabel(lot.useBy)} · není skladem</option>`);
+    return opts.join('');
+  };
+  /** Nápověda pro skladníka, kterou trvanlivost vzít (vybraná v objednávce, jinak nejkratší). */
+  const lotHint = (p, o, it, inDialog = false) => {
+    if (it.lot) { const q = lotQtyOf(p, o.wh, it.lot); return `<div class="${inDialog ? 'pack-note' : 'small'} lot-hint">📅 Vydej trvanlivost <strong>${lotLabel(it.lot.useBy)}</strong> · skladem ${fmtQty(q)} ${esc(p.unit)}${q < (it.picked ?? it.qty) ? ' <span class="badge warn">nestačí</span>' : ''}</div>`; }
+    const lots = lotsOf(p, o.wh);
+    return lots.length > 1 && lots[0].useBy ? `<div class="small muted">📅 Nejdřív se vydává ${lotLabel(lots[0].useBy)} (${fmtQty(lots[0].qty)} ${esc(p.unit)})</div>` : '';
+  };
+  /** Kolik jde vydat z vybrané šarže – včetně toho, co z ní tato položka už vydala (při opakovaném vydání se to nejdřív vrátí). */
+  function lotAvailable(o, it, p) {
+    const m = orderMovementOf(o); const old = m && m.items.find(l => l.orderItemId === it.id);
+    const back = old && old.batches ? old.batches.filter(b => sameLot(b.useBy, it.lot.useBy)).reduce((s, b) => s + b.qty, 0) : 0;
+    return round3(lotQtyOf(p, o.wh, it.lot) + back);
+  }
+  /** Odebere množství ze šarží: nejdřív z vybrané trvanlivosti `lot` (objednávka), zbytek podle FEFO. */
+  function takeFromBatches(p, qty, wh, lot = null) {
     const taken = []; let left = round3(qty);
-    for (const b of sortedBatches(p, wh)) {
+    const all = sortedBatches(p, wh);
+    const order = lot ? [...all.filter(b => sameLot(b.useBy, lot.useBy)), ...all.filter(b => !sameLot(b.useBy, lot.useBy))] : all;
+    for (const b of order) {
       if (left <= 0) break;
       const t = Math.min(b.qty, left); if (t <= 0) continue;
       b.qty = round3(b.qty - t); left = round3(left - t); taken.push({ id: b.id, qty: t, useBy: b.useBy || null, prodDate: b.prodDate || null });
@@ -182,6 +218,7 @@
   const lineInfo = (i) => [
     i.weights && i.weights.length > 1 ? 'váhy ' + i.weights.map(fmtQty).join(' + ') : '',
     i.useBy ? 'spotřeba do ' + fmtDay(i.useBy) : '',
+    i.lot ? 'vybraná trvanlivost ' + lotLabel(i.lot.useBy) : '',
     i.batches && i.batches.some(b => b.useBy) ? 'šarže ' + [...new Set(i.batches.filter(b => b.useBy).map(b => fmtDay(b.useBy)))].join(', ') : '',
     i.manual ? 'bez skenu' : '',
     i.whTo ? `→ ${i.whTo}: před ${fmtQty(i.toBefore)}, po ${fmtQty(i.toAfter)}` : ''
@@ -209,7 +246,7 @@
       Object.assign(line, { whTo, toBefore, toAfter: round3(toBefore + qty) });
     }
     else if (diff > 0) { const b = { qty: diff, prodDate: it.prodDate || null, useBy: it.useBy || null, wh }; addBatch(p, b); line.prodDate = b.prodDate; line.useBy = b.useBy; }
-    else if (diff < 0) line.batches = takeFromBatches(p, -diff, wh);
+    else if (diff < 0) { line.batches = takeFromBatches(p, -diff, wh, it.lot || null); if (it.lot) line.lot = it.lot; }
     if (it.weights) line.weights = it.weights;
     if (it.prodDate) p.lastProdDate = it.prodDate;
     if (it.useBy) p.lastUseBy = it.useBy;
@@ -407,7 +444,7 @@
 
   /** Dotaz na množství. S `dates: true` (příjem) navíc datum výroby a trvanlivost a vrací objekt {qty, prodDate, useBy}.
    *  S `pack` (naskenovaný karton) je navíc pole „Počet balení“, které dopočítá celkové množství. */
-  async function qtyDialog(product, { title, defaultQty = 1, extraHtml = '', dates = false, prodDate = '', useBy = '', wh = state.wh, pack = null, packsDefault = 1 } = {}) {
+  async function qtyDialog(product, { title, defaultQty = 1, extraHtml = '', dates = false, prodDate = '', useBy = '', wh = state.wh, pack = null, packsDefault = 1, lots = null } = {}) {
     const res = await dialog(`
       <div class="modal-head"><strong>${esc(title || product.name)}</strong><button class="iconbtn" data-close>✕</button></div>
       <div class="muted mono" style="margin-bottom:8px">${esc(product.code)} · skladem ${fmtQty(stockOf(product, wh))} ${esc(product.unit)} ${whBadge(wh)}</div>
@@ -418,6 +455,7 @@
           <div class="field"><label>Počet balení</label><input name="packs" type="number" step="any" min="0" inputmode="decimal" value="${esc(packsDefault)}"></div>
           <div class="field"><label>Celkem (${esc(product.unit)})</label><input name="qty" type="number" step="any" min="0" inputmode="decimal" value="${defaultQty}" required></div>
         </div>` : `<div class="field"><label>Množství (${esc(product.unit)})</label><input name="qty" type="number" step="any" min="0" inputmode="decimal" value="${defaultQty}" required></div>`}
+        ${lots && lots.length > 1 ? `<div class="field"><label>Trvanlivost ze skladu (která šarže se má vydat)</label><select name="lot">${lotOptions(product, wh, null, product.unit)}</select></div>` : ''}
         ${dates ? `<div class="grid2">
           <div class="field"><label>Datum výroby</label><input name="prodDate" type="date" value="${esc(prodDate)}"></div>
           <div class="field"><label>Spotřebujte do${product.shelfLifeDays ? ` (výroba + ${product.shelfLifeDays} dní)` : ''}</label><input name="useBy" type="date" value="${esc(useBy)}"></div>
@@ -438,16 +476,18 @@
     if (!res) return null;
     const q = Number(res.qty);
     if (!Number.isFinite(q)) return null;
+    if (lots) return { qty: q, lot: lotFromVal(res.lot || '') };
     return dates ? { qty: q, prodDate: res.prodDate || null, useBy: res.useBy || null } : q;
   }
 
   /** Vážené zboží (kg): skladník zapíše váhu každého kusu, součet jde do objednávky. */
-  function weighDialog(p, orderedQty, previous) {
+  function weighDialog(p, orderedQty, previous, extraHtml = '') {
     return new Promise((resolve) => {
       let weights = previous && previous.length ? previous.map(String) : [''];
       dialog(`
         <div class="modal-head"><strong>⚖️ Zvaž: ${esc(p.name)}</strong><button class="iconbtn" data-close>✕</button></div>
         <p class="muted small" style="margin-top:0">Objednáno <strong>${fmtQty(orderedQty)} ${esc(p.unit)}</strong>. Zapiš váhu každého kusu, součet se zapíše do objednávky.</p>
+        ${extraHtml}
         <div id="wRows" class="list"></div>
         <div class="row" style="margin-top:10px"><button type="button" class="btn secondary sm" id="wAdd">＋ Další kus</button><span class="grow"></span><div>Celkem <strong id="wTotal">0</strong> ${esc(p.unit)}</div></div>
         <div class="row" style="justify-content:flex-end;margin-top:12px"><button type="button" class="btn secondary" data-close>Zrušit</button><button type="button" class="btn" id="wOk">OK</button></div>`, {
@@ -950,7 +990,20 @@
         <div class="row" style="justify-content:flex-end;margin-top:12px"><button class="btn secondary" data-close>Zrušit</button><button class="btn" id="ofSave">Uložit objednávku</button></div>`, {
         onOpen(card, close) {
           const whSel = () => $('#ofWh', card).value || o.wh;
-          $('#ofWh', card).onchange = () => drawItems();
+          $('#ofWh', card).onchange = () => {
+            // Jiný sklad → vybraná trvanlivost, která tam není, se vrátí na „automaticky“.
+            o.items.forEach(it => { if (it.lot && it.picked == null) { const p = it.productId && productById(it.productId); if (!p || !lotsOf(p, whSel()).some(l => sameLot(l.useBy, it.lot.useBy))) delete it.lot; } });
+            drawItems();
+          };
+          /** Řádek s výběrem trvanlivosti: <select>, když je ve skladu víc šarží; jinak jen text. */
+          const lotRow = (it, i) => {
+            const p = it.productId && productById(it.productId); if (!p) return '';
+            if (it.picked != null) return it.lot ? `<div class="small muted">📅 trvanlivost ${lotLabel(it.lot.useBy)}</div>` : '';
+            const lots = lotsOf(p, whSel());
+            if (lots.length > 1 || (it.lot && !lots.some(l => sameLot(l.useBy, it.lot.useBy)))) return `<div class="lot-row"><label class="small muted">📅 Trvanlivost ze skladu</label><select data-olot="${i}" class="lot-sel">${lotOptions(p, whSel(), it.lot, it.unit)}</select></div>`;
+            if (lots.length === 1 && lots[0].useBy) return `<div class="small muted">📅 jediná šarže ${lotLabel(lots[0].useBy)} (${fmtQty(lots[0].qty)} ${esc(it.unit)})</div>`;
+            return '';
+          };
           // Známý odběratel → doplní se jeho fakturační údaje z poslední objednávky.
           $('#ofCustomer', card).onchange = () => {
             const prev = state.orders.find(x => x.customer === $('#ofCustomer', card).value.trim() && (x.custAddress || x.custIco || x.custDic));
@@ -964,14 +1017,16 @@
             $('#ofItems', card).innerHTML = o.items.length ? o.items.map((it, i) => `
               <div class="order-item">
                 <div class="grow"><div class="name">${it.productId ? esc(it.name) : `<span class="badge danger">nenalezeno</span> ${esc(it.name)}`}</div>
-                  <div class="muted small">${it.raw && it.raw !== it.name ? '„' + esc(it.raw) + '“ · ' : ''}${it.productId ? esc(it.code) + ' · skladem ' + fmtQty(stockOf(productById(it.productId), whSel())) + ' ' + esc(it.unit) + ' (' + esc(whSel()) + ')' : ''}${it.confidence != null && it.confidence < 0.8 && it.productId ? ' · <span class="badge warn">ověř</span>' : ''}</div></div>
+                  <div class="muted small">${it.raw && it.raw !== it.name ? '„' + esc(it.raw) + '“ · ' : ''}${it.productId ? esc(it.code) + ' · skladem ' + fmtQty(stockOf(productById(it.productId), whSel())) + ' ' + esc(it.unit) + ' (' + esc(whSel()) + ')' : ''}${it.confidence != null && it.confidence < 0.8 && it.productId ? ' · <span class="badge warn">ověř</span>' : ''}</div>
+                  ${lotRow(it, i)}</div>
                 <div class="qty-ctl"><input type="number" step="any" min="0" data-oq="${i}" value="${it.qty}"><span class="small muted">${esc(it.unit)}</span></div>
                 <button class="iconbtn" data-omap="${i}" title="Přiřadit produkt">🔗</button>
                 ${it.picked != null ? '<span class="badge ok" title="Už vydáno ze skladu">vydáno</span>' : `<button class="iconbtn" data-odel="${i}" title="Odebrat">🗑</button>`}
               </div>`).join('') : '<div class="empty small">Zatím žádné položky. Vlož text a klikni „Rozpoznat“, nebo přidej produkty ručně.</div>';
             $$('[data-oq]', card).forEach(i => i.onchange = () => { o.items[i.dataset.oq].qty = Number(i.value) || 0; });
             $$('[data-odel]', card).forEach(b => b.onclick = () => { o.items.splice(b.dataset.odel, 1); drawItems(); });
-            $$('[data-omap]', card).forEach(b => b.onclick = async () => { const p = await pickProduct(); if (p) { const it = o.items[b.dataset.omap]; it.productId = p.id; it.code = p.code; it.name = p.name; it.unit = p.unit; it.confidence = 1; drawItems(); } });
+            $$('[data-olot]', card).forEach(s => s.onchange = () => { const lot = lotFromVal(s.value); if (lot) o.items[s.dataset.olot].lot = lot; else delete o.items[s.dataset.olot].lot; drawItems(); });
+            $$('[data-omap]', card).forEach(b => b.onclick = async () => { const p = await pickProduct(); if (p) { const it = o.items[b.dataset.omap]; it.productId = p.id; it.code = p.code; it.name = p.name; it.unit = p.unit; it.confidence = 1; delete it.lot; drawItems(); } });
           };
           drawItems();
           const busy = (on) => { $$('button', card).forEach(b => b.disabled = on); };
@@ -1003,9 +1058,10 @@
           }
           $('#ofPick', card).onclick = async () => {
             const p = await pickProduct(); if (!p) return;
-            const q = await qtyDialog(p, { title: `Objednat: ${p.name}`, wh: whSel() }); if (q === null) return;
+            const r = await qtyDialog(p, { title: `Objednat: ${p.name}`, wh: whSel(), lots: lotsOf(p, whSel()) }); if (r === null) return;
             const ex = o.items.find(i => i.productId === p.id);
-            if (ex) ex.qty = q; else o.items.push({ productId: p.id, code: p.code, name: p.name, qty: q, unit: p.unit, raw: '', confidence: 1 });
+            if (ex) { ex.qty = r.qty; if (r.lot) ex.lot = r.lot; else delete ex.lot; }
+            else o.items.push({ productId: p.id, code: p.code, name: p.name, qty: r.qty, unit: p.unit, raw: '', confidence: 1, ...(r.lot ? { lot: r.lot } : {}) });
             drawItems();
           };
           $('#ofSave', card).onclick = async () => {
@@ -1053,10 +1109,11 @@
     if (!m) { m = { id: uid(), type: 'issue', ts: Date.now(), docNo: await nextDocNo('issue', o.wh), items: [], by: state.user, partner: o.customer, note: `Objednávka ${o.no}`, orderId: o.id, wh: o.wh, whTo: null }; o.movementId = m.id; }
     const old = m.items.find(l => l.orderItemId === itemId);
     if (old) { setStockOf(p, o.wh, stockOf(p, o.wh) + old.qty); returnToBatches(p, old.batches, old.qty, o.wh); m.items = m.items.filter(l => l !== old); }
-    const line = applyLine(p, 'issue', { qty, weights: extra.weights || null }, o.wh);
+    const line = applyLine(p, 'issue', { qty, weights: extra.weights || null, lot: it.lot || null }, o.wh);
     Object.assign(line, { orderItemId: itemId, ts: Date.now(), by: state.user, manual: !!extra.manual });
     m.items.push(line); m.updatedAt = Date.now();
-    Object.assign(it, { picked: qty, pickedAt: Date.now(), pickedBy: state.user, weights: extra.weights || null, manual: !!extra.manual });
+    Object.assign(it, { picked: qty, pickedAt: Date.now(), pickedBy: state.user, weights: extra.weights || null, manual: !!extra.manual,
+      pickedLots: [...new Set((line.batches || []).map(b => b.useBy || null))] }); // ze kterých trvanlivostí se opravdu vydalo
     if (o.status === 'new') o.status = 'preparing';
     await DB.applyMovement(m, [p]);
     await saveOrder(o);
@@ -1070,7 +1127,7 @@
       m.items = m.items.filter(l => l !== old); m.updatedAt = Date.now();
       await DB.applyMovement(m, [p]);
     }
-    Object.assign(it, { picked: null, pickedAt: null, pickedBy: null, weights: null, manual: false });
+    Object.assign(it, { picked: null, pickedAt: null, pickedBy: null, weights: null, manual: false, pickedLots: null });
     await saveOrder(o);
   }
 
@@ -1097,11 +1154,17 @@
   async function pickQty(o, itemId, manual = false, pack = null) {
     const it = o.items.find(i => i.id === itemId); const p = it && productById(it.productId); if (!p) return;
     let qty, weights = null;
-    if (isWeighed(p)) { const r = await weighDialog(p, it.qty, it.weights); if (!r) return; qty = r.total; weights = r.weights; }
+    const lotNote = lotHint(p, o, it, true);
+    if (isWeighed(p)) { const r = await weighDialog(p, it.qty, it.weights, lotNote); if (!r) return; qty = r.total; weights = r.weights; }
     else {
       const packsDef = pack && Number.isInteger(it.qty / pack.qty) ? it.qty / pack.qty : '';
-      const q = await qtyDialog(p, { title: `Vydat: ${p.name}`, defaultQty: it.picked ?? it.qty, wh: o.wh, pack, packsDefault: packsDef, extraHtml: `<p class="muted small" style="margin-top:0">Objednáno <strong>${fmtQty(it.qty)} ${esc(p.unit)}</strong>. Potvrď, nebo uprav skutečně vydané množství.</p>` });
+      const q = await qtyDialog(p, { title: `Vydat: ${p.name}`, defaultQty: it.picked ?? it.qty, wh: o.wh, pack, packsDefault: packsDef, extraHtml: `<p class="muted small" style="margin-top:0">Objednáno <strong>${fmtQty(it.qty)} ${esc(p.unit)}</strong>. Potvrď, nebo uprav skutečně vydané množství.</p>${lotNote}` });
       if (q === null || q <= 0) return; qty = q;
+    }
+    if (it.lot) {
+      // Vybraná trvanlivost nestačí → skladník to musí vědět; zbytek se odepíše z nejbližší další šarže.
+      const avail = lotAvailable(o, it, p);
+      if (qty > avail && !await confirmDlg('Šarže nestačí', `Z trvanlivosti ${lotLabel(it.lot.useBy)} je skladem jen ${fmtQty(avail)} ${p.unit}, vydává se ${fmtQty(qty)} ${p.unit}. Zbytek se odepíše z nejbližší další trvanlivosti.`, 'Vydat i z jiné šarže')) return;
     }
     await orderPick(o, itemId, qty, { weights, manual });
     toast(`✓ ${p.name}: ${fmtQty(qty)} ${p.unit} vydáno`); render();
@@ -1141,7 +1204,8 @@
           <div class="pick-mark">${done ? '✅' : (p ? (editable ? '📷' : '○') : '⚠️')}</div>
           <div class="grow"><div class="name">${esc(it.name)}${!p ? ' <span class="badge danger">není v katalogu</span>' : ''}</div>
             <div class="muted small">${p ? `${esc(p.location || 'bez umístění')} · ${esc(p.code)} · skladem ${fmtQty(stockOf(p, o.wh))} ${esc(p.unit)} (${esc(o.wh)})` : esc(it.raw || '')}</div>
-            ${done ? `<div class="small picked-info">Vydáno ${fmtQty(it.picked)} ${esc(it.unit)}${it.weights && it.weights.length > 1 ? ' (' + it.weights.map(fmtQty).join(' + ') + ')' : ''}${it.manual ? ' · bez skenu' : ''}${it.pickedBy ? ' · ' + esc(it.pickedBy) : ''}</div>` : ''}</div>
+            ${p && !done && editable ? lotHint(p, o, it) : ''}
+            ${done ? `<div class="small picked-info">Vydáno ${fmtQty(it.picked)} ${esc(it.unit)}${it.weights && it.weights.length > 1 ? ' (' + it.weights.map(fmtQty).join(' + ') + ')' : ''}${it.pickedLots && it.pickedLots.some(Boolean) ? ' · šarže ' + it.pickedLots.filter(Boolean).map(lotLabel).join(', ') : ''}${it.manual ? ' · bez skenu' : ''}${it.pickedBy ? ' · ' + esc(it.pickedBy) : ''}</div>` : ''}</div>
           <div class="qty-big">${fmtQty(it.qty)} <span class="small muted">${esc(it.unit)}</span></div>
           ${editable && p ? `<button class="iconbtn" data-more="${it.id}" title="Další možnosti">⋯</button>` : ''}
         </div>`;
@@ -1221,7 +1285,7 @@
     };
     const dn = $('#ordDone', el); if (dn) dn.onclick = async () => { o.status = 'done'; o.doneAt = Date.now(); await saveOrder(o); render(); };
     const cp = $('#ordCopy', el); if (cp) cp.onclick = async () => {
-      const items = o.items.map(i => ({ ...i, id: uid(), picked: null, pickedAt: null, pickedBy: null, weights: null, manual: false }));
+      const items = o.items.map(i => { const c = { ...i, id: uid(), picked: null, pickedAt: null, pickedBy: null, weights: null, manual: false, pickedLots: null }; delete c.lot; return c; });
       const n = await orderForm({ ...o, id: uid(), no: '', ts: Date.now(), status: 'new', items, preparedBy: null, preparedAt: null, movementId: null, doneAt: null, invoiceNo: null, invoiceAt: null, createdBy: state.user });
       if (n) location.hash = `#/objednavka?id=${n.id}`;
     };
@@ -1535,8 +1599,11 @@
       }
       await loadAll();
       const demoProducts = state.products.filter(p => demo.some(d => d[0] === p.code));
-      await commitMovement('receipt', demoProducts.map(p => ({ productId: p.id, qty: Math.round(Math.random() * 80 + 20) })), { partner: 'Ukázkový dodavatel', note: 'Ukázková data', wh: 'CZ' });
+      const dated = (p) => ['Mléčné výrobky', 'Maso'].includes(p.category); // čerstvé zboží dostane trvanlivost
+      await commitMovement('receipt', demoProducts.map(p => ({ productId: p.id, qty: Math.round(Math.random() * 80 + 20), useBy: dated(p) ? addDays(today(), 45) : null })), { partner: 'Ukázkový dodavatel', note: 'Ukázková data', wh: 'CZ' });
       await commitMovement('receipt', demoProducts.slice(0, 3).map(p => ({ productId: p.id, qty: Math.round(Math.random() * 30 + 10) })), { partner: 'Ukázkový dodavatel SK', note: 'Ukázková data', wh: 'SK' });
+      // Druhá, kratší trvanlivost u sýru a másla → v objednávce jde vybrat, která šarže se vydá.
+      await commitMovement('receipt', demoProducts.filter(p => ['8594001234567', '8594007654321'].includes(p.code)).map(p => ({ productId: p.id, qty: Math.round(Math.random() * 20 + 12), useBy: addDays(today(), 20) })), { partner: 'Ukázkový dodavatel', note: 'Ukázková data – kratší trvanlivost', wh: 'CZ' });
       toast('Ukázková data nahrána'); render();
     };
   };

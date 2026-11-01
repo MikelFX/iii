@@ -306,3 +306,8 @@ tr.clickable:hover { background: var(--bg); }
 .pack-row { gap: 6px; margin-bottom: 6px; }
 .pack-row input[type=number] { width: 84px; flex: none; text-align: right; }
 .pack-note { background: var(--ok-bg); color: var(--ok); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; font-weight: 600; }
+.lot-row { margin-top: 4px; }
+.lot-row label { display: block; margin-bottom: 2px; }
+.lot-sel { min-height: 36px; padding: 4px 8px; font-size: 14px; max-width: 100%; width: auto; }
+.lot-hint { margin-top: 4px; }
+.lot-hint.small { color: var(--ok); font-weight: 600; }
