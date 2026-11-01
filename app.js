@@ -15,7 +15,7 @@
   const ORDER_STATUS = { new: 'Nová', preparing: 'Připravuje se', ready: 'Připraveno', done: 'Vydáno', cancelled: 'Zrušeno' };
   const TYPE_BADGE = { receipt: 'ok', issue: 'warn', inventory: 'neutral', adjust: 'neutral', transfer: 'neutral' };
   const UNITS = ['ks', 'kg', 'g', 'l', 'ml', 'bal', 'krt', 'pal', 'm'];
-  const APP_VERSION = '0.4.0';
+  const APP_VERSION = '0.4.1';
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -33,11 +33,30 @@
   }
 
   // ---------- Dialog ----------
+  /** Vrstvení oken: co se otevře později, je navrchu (okno nad skenerem, skener nad oknem, druhé okno nad prvním). */
+  function raiseLayer(el) {
+    const open = [...document.querySelectorAll('.modal:not(.hidden)')].filter(x => x !== el);
+    el.style.zIndex = open.length ? Math.max(...open.map(x => Number(x.style.zIndex) || 50)) + 1 : '';
+  }
+  /** Modální okno. Když už je jedno otevřené (např. formulář objednávky → Vybrat produkt), otevře se další okno NAD ním
+   *  a to první zůstane nedotčené – dřív se obě okna přepisovala v jednom prvku a formulář objednávky se tím smazal. */
   function dialog(html, { onOpen } = {}) {
     return new Promise((resolve) => {
-      const m = $('#dlg'); const card = $('#dlgCard');
-      card.innerHTML = html; m.classList.remove('hidden');
-      const close = (val) => { m.classList.add('hidden'); card.innerHTML = ''; m.onclick = null; resolve(val); };
+      const base = $('#dlg');
+      const nested = !base.classList.contains('hidden');
+      let m, card;
+      if (nested) {
+        m = document.createElement('div'); m.className = 'modal';
+        card = document.createElement('div'); card.className = 'modal-card';
+        m.appendChild(card); document.body.appendChild(m);
+      } else { m = base; card = $('#dlgCard'); }
+      card.innerHTML = html; m.classList.remove('hidden'); raiseLayer(m);
+      let done = false;
+      const close = (val) => {
+        if (done) return; done = true;
+        if (nested) m.remove(); else { m.classList.add('hidden'); card.innerHTML = ''; m.style.zIndex = ''; }
+        m.onclick = null; resolve(val);
+      };
       m.onclick = (e) => { if (e.target === m) close(null); };
       $$('[data-close]', card).forEach(b => b.onclick = () => close(b.dataset.close === 'ok' ? collect(card) : null));
       const f = $('form', card);
@@ -223,7 +242,7 @@
       $('#scanTitle').textContent = title;
       $('#scanLast').textContent = ''; $('#scanLast').className = 'scan-last';
       $('#scanManual').value = '';
-      $('#scanModal').classList.remove('hidden');
+      $('#scanModal').classList.remove('hidden'); raiseLayer($('#scanModal'));
       await this.start();
     },
     async start() {
@@ -259,7 +278,7 @@
     async pause() { if (this.running && this.html5) { try { this.html5.pause(true); } catch (_) {} } },
     async resume() { if (this.running && this.html5) { try { this.html5.resume(); } catch (_) {} } },
     async close() {
-      $('#scanModal').classList.add('hidden');
+      $('#scanModal').classList.add('hidden'); $('#scanModal').style.zIndex = '';
       if (this.html5 && this.running) { try { await this.html5.stop(); } catch (_) {} }
       this.running = false; this.onCode = null;
     }
@@ -1013,7 +1032,7 @@
         <div class="chips" style="margin:0">${[['open', 'K vyřízení'], ['ready', 'Připravené'], ['done', 'Vydané'], ['all', 'Vše']].map(([k, l]) => `<span class="chip ${orderFilter === k ? 'active' : ''}" data-f="${k}">${l}</span>`).join('')}</div>
         <button class="btn" id="ordNew">＋ Nová objednávka</button>
       </div>
-      ${DB.mode !== 'remote' ? '<p class="muted small">Objednávky jsou zatím jen v tomto zařízení. Pro posílání z kanclu do mobilů nastav společnou databázi v Nastavení.</p>' : ''}
+      ${DB.mode !== 'remote' ? '<p class="muted small">Toto zařízení pracuje bez společné databáze – objednávky jsou jen v něm a z kanclu sem nepřijdou. <a href="#/nastaveni">Připojit v Nastavení</a>.</p>' : ''}
       ${list.length ? `<div class="list">${list.map(o => `<div class="item clickable" data-oid="${o.id}">
         <div class="grow"><div class="name">${esc(o.no)} · ${esc(o.customer || 'bez odběratele')}</div>
           <div class="code">${whBadge(o.wh)} ${o.items.length} položek · ${fmtDate(o.ts)}${o.note ? ' · ' + esc(o.note) : ''}${o.createdBy ? ' · ' + esc(o.createdBy) : ''}${o.invoiceNo ? ' · 🧾 ' + esc(o.invoiceNo) : ''}</div></div>
@@ -1365,15 +1384,21 @@
   routes['/nastaveni'] = async (el) => {
     setTitle('Nastavení');
     const theme = document.documentElement.dataset.theme || 'auto';
-    const cfg = DB.config() || {};
+    const cfg = DB.config() || DB.defaultConfig || {};
     el.innerHTML = `
       <div class="card"><h2>Společná databáze (Supabase)</h2>
-        <p class="muted small">Propojí kancl (PC) a sklad (mobily): objednávky a stavy se sdílí živě. ${DB.mode === 'remote' ? `<span class="badge ok">připojeno</span> ${state.user ? 'jako ' + esc(state.user) : ''}` : '<span class="badge neutral">jen toto zařízení</span>'} Návod je v souboru <span class="mono">supabase/NAVOD.md</span>.</p>
-        <div class="grid2">
-          <div class="field"><label>Project URL</label><input id="sbUrl" value="${esc(cfg.url || '')}" placeholder="https://xxxx.supabase.co"></div>
-          <div class="field"><label>anon public key</label><input id="sbKey" value="${esc(cfg.key || '')}" placeholder="eyJ…"></div>
-        </div>
-        <div class="row"><button class="btn" id="sbSave">Uložit a připojit</button>${DB.mode === 'remote' ? '<button class="btn secondary" id="sbUpload">Nahrát lokální data do databáze</button><button class="btn secondary" id="sbLogout">Odhlásit</button><button class="btn secondary" id="sbOff">Odpojit</button>' : ''}</div>
+        <p class="muted small">Propojí kancl (PC) a sklad (mobily): objednávky a stavy se sdílí živě. ${DB.mode === 'remote' ? `<span class="badge ok">připojeno</span> ${state.user ? 'jako ' + esc(state.user) : ''}` : '<span class="badge neutral">jen toto zařízení</span>'}</p>
+        ${DB.mode === 'remote' ? `<div class="row"><button class="btn secondary" id="sbUpload">Nahrát lokální data do databáze</button><button class="btn secondary" id="sbLogout">Odhlásit</button><button class="btn secondary" id="sbOff">Odpojit</button></div>`
+          : `<p class="small">Toto zařízení teď pracuje jen samo pro sebe: objednávky z kanclu se sem nedostanou a stavy se nesdílí. Klepni na Připojit a přihlas se svým účtem.</p>
+          <div class="row"><button class="btn" id="sbConnect">🔗 Připojit ke společné databázi</button></div>`}
+        <details class="field" style="margin-top:10px"><summary class="small">Vlastní projekt Supabase (pokročilé)</summary>
+          <p class="muted small" style="margin-top:8px">Návod je v souboru <span class="mono">supabase/NAVOD.md</span>.</p>
+          <div class="grid2">
+            <div class="field"><label>Project URL</label><input id="sbUrl" value="${esc(cfg.url || '')}" placeholder="https://xxxx.supabase.co"></div>
+            <div class="field"><label>anon public key</label><input id="sbKey" value="${esc(cfg.key || '')}" placeholder="eyJ…"></div>
+          </div>
+          <div class="row"><button class="btn secondary" id="sbSave">Uložit a připojit</button></div>
+        </details>
       </div>
       <div class="card"><h2>Sklady CZ a SK</h2>
         <p class="muted small">Každý sklad má vlastní stavy, šarže, inventuru i číselnou řadu dokladů. Zboží mezi nimi přesuneš přes <a href="#/presun">Přesun CZ ⇄ SK</a>. Objednávka má svůj sklad určený při zadání.</p>
@@ -1421,6 +1446,8 @@
       if (!url || !key) return toast('Vyplň URL i klíč');
       DB.setConfig({ url, key }); location.reload();
     };
+    // Zařízení odpojené od společné databáze (třeba omylem přes „Pracovat bez společné databáze“) → zpět na výchozí projekt IMCO a přihlášení.
+    const con = $('#sbConnect'); if (con) con.onclick = () => { DB.resetConfig(); location.reload(); };
     const off = $('#sbOff'); if (off) off.onclick = async () => { if (!await confirmDlg('Odpojit', 'Aplikace se vrátí k datům uloženým jen v tomto zařízení.', 'Odpojit')) return; await DB.signOut(); DB.setConfig(null); location.reload(); };
     const lo = $('#sbLogout'); if (lo) lo.onclick = async () => { await DB.signOut(); location.reload(); };
     const up = $('#sbUpload'); if (up) up.onclick = async () => {

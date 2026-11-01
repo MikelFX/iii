@@ -147,7 +147,10 @@ const DB = (() => {
     get mode() { return impl.name; },
     get client() { return client; },
     config, init,
+    get defaultConfig() { return DEFAULT_CONFIG; },
     setConfig(cfg) { try { localStorage.setItem('supabase', cfg ? JSON.stringify(cfg) : 'off'); } catch (_) {} init(); },
+    /** Zpět na výchozí společnou databázi (zruší „jen toto zařízení“ i vlastní nastavení). */
+    resetConfig() { try { localStorage.removeItem('supabase'); } catch (_) {} init(); },
     getAll: (s) => impl.getAll(s), get: (s, k) => impl.get(s, k), put: (s, o) => impl.put(s, o), del: (s, k) => impl.del(s, k), clear: (s) => impl.clear(s),
     applyMovement: (m, p) => impl.applyMovement(m, p), importAll: (d, o) => impl.importAll(d, o), subscribe: (fn) => impl.subscribe(fn),
     local: LocalDB,
