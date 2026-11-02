@@ -183,6 +183,15 @@ tr.clickable:hover { background: var(--bg); }
 .modal-head strong { font-size: 17px; }
 #reader { width: 100%; border-radius: 12px; overflow: hidden; background: #000; min-height: 240px; }
 #reader video { border-radius: 12px; }
+.cam-wrap { position: relative; width: 100%; aspect-ratio: 4 / 3; max-height: 60vh; background: #000; }
+.cam-wrap video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.scan-guide { position: absolute; left: 3%; right: 3%; top: 25%; bottom: 25%; border: 3px solid rgba(255,255,255,.85); border-radius: 10px; box-shadow: 0 0 0 9999px rgba(0,0,0,.28); pointer-events: none; }
+.scan-guide span { position: absolute; left: 4%; right: 4%; top: 50%; height: 2px; background: rgba(255,60,60,.8); }
+.cam-tools { position: absolute; right: 8px; top: 8px; display: flex; gap: 8px; }
+.camtool { min-width: 48px; height: 44px; border-radius: 22px; border: 0; background: rgba(0,0,0,.55); color: #fff; font-size: 18px; font-weight: 600; }
+.camtool.on { background: #f5c400; color: #000; }
+.camtool.hidden { display: none; }
+.cam-hint { position: absolute; left: 0; right: 0; bottom: 6px; text-align: center; color: #fff; font-size: 13px; text-shadow: 0 1px 2px #000; pointer-events: none; }
 .scan-manual { display: flex; gap: 8px; margin-top: 10px; }
 .scan-last { margin-top: 10px; min-height: 22px; font-size: 14px; }
 .scan-last.ok { color: var(--ok); }

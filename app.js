@@ -15,7 +15,7 @@
   const ORDER_STATUS = { new: 'Nová', preparing: 'Připravuje se', ready: 'Připraveno', done: 'Vydáno', cancelled: 'Zrušeno' };
   const TYPE_BADGE = { receipt: 'ok', issue: 'warn', inventory: 'neutral', adjust: 'neutral', transfer: 'neutral' };
   const UNITS = ['ks', 'kg', 'g', 'l', 'ml', 'bal', 'krt', 'pal', 'm'];
-  const APP_VERSION = '0.5.0';
+  const APP_VERSION = '0.6.0';
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -134,16 +134,39 @@
   /** Najde produkt podle hlavního kódu nebo kódu balení (karton). */
   const productByCode = (code) => { const c = normCode(code); return state.products.find(p => p.code === c || (p.packs || []).some(k => k.code === c)); };
   /** Co bylo naskenováno: {p, pack} – pack = balení (karton) s počtem kusů uvnitř, u hlavního kódu null. */
-  const lookupCode = (code) => { const c = normCode(code); const p = productByCode(c); if (!p) return null; const pack = (p.packs || []).find(k => k.code === c && Number(k.qty) > 1) || null; return { p, pack }; };
+  const lookupCode = (code) => {
+    const g = window.GS1 ? GS1.parse(code) : null;
+    if (g) {
+      // GS1 etiketa (karton / paleta): hledá se podle GTIN – jako kód balení, hlavní kód nebo EAN odvozený z GTIN-14.
+      if (!g.gtin) return null;
+      for (const cand of GS1.candidates(g.gtin)) {
+        const p = productByCode(cand.code); if (!p) continue;
+        const pack = (p.packs || []).find(k => k.code === cand.code && Number(k.qty) > 1) || null;
+        return { p, pack, gs1: g, derived: cand.derived && !pack };
+      }
+      return null;
+    }
+    const c = normCode(code); const p = productByCode(c); if (!p) return null; const pack = (p.packs || []).find(k => k.code === c && Number(k.qty) > 1) || null; return { p, pack };
+  };
+  /** Kolik jednotek produktu znamená naskenovaná GS1 etiketa: váha z (310n) u váženého zboží, jinak balení × počet (37). null = neví se. */
+  const gs1Qty = (hit) => {
+    if (!hit || !hit.gs1) return null; const g = hit.gs1, p = hit.p;
+    if (isWeighed(p) && g.netKg) return round3(p.unit === 'g' ? g.netKg * 1000 : g.netKg);
+    const n = g.contentGtin && g.count ? g.count : 1;
+    if (hit.pack) return round3(hit.pack.qty * n);
+    if (g.contentGtin && g.count && !hit.derived) return g.count;
+    if (!hit.derived && !g.contentGtin) return 1; // GTIN přímo spotřebitelské jednotky
+    return null;
+  };
   const packLabel = (p, pack) => `balení ${fmtQty(pack.qty)} ${p.unit}`;
   const productById = (id) => state.products.find(p => p.id === id);
   async function setSetting(key, value) { state.settings[key] = value; await DB.put('settings', { key, value }); }
 
   async function saveProduct(p) {
-    p.code = normCode(p.code); p.name = p.name.trim();
+    p.code = normCode(window.GS1 ? GS1.keyOf(p.code) : p.code); p.name = p.name.trim();
     if (!p.code) throw new Error('Kód je povinný.');
     if (!p.name) throw new Error('Název je povinný.');
-    p.packs = (p.packs || []).map(k => ({ code: normCode(k.code), qty: Number(k.qty) > 0 ? round3(Number(k.qty)) : 1 })).filter(k => k.code && k.code !== p.code);
+    p.packs = (p.packs || []).map(k => ({ code: normCode(window.GS1 ? GS1.keyOf(k.code) : k.code), qty: Number(k.qty) > 0 ? round3(Number(k.qty)) : 1 })).filter(k => k.code && k.code !== p.code);
     const codes = [p.code, ...p.packs.map(k => k.code)];
     if (new Set(codes).size !== codes.length) throw new Error('Stejný kód je u produktu zadaný dvakrát.');
     for (const c of codes) { const dup = productByCode(c); if (dup && dup.id !== p.id) throw new Error(`Kód ${c} už má produkt „${dup.name}“.`); }
@@ -204,7 +227,7 @@
     for (const b of order) {
       if (left <= 0) break;
       const t = Math.min(b.qty, left); if (t <= 0) continue;
-      b.qty = round3(b.qty - t); left = round3(left - t); taken.push({ id: b.id, qty: t, useBy: b.useBy || null, prodDate: b.prodDate || null });
+      b.qty = round3(b.qty - t); left = round3(left - t); taken.push({ id: b.id, qty: t, useBy: b.useBy || null, prodDate: b.prodDate || null, lotNo: b.lotNo || null });
     }
     p.batches = (p.batches || []).filter(b => b.qty > 0);
     return taken;
@@ -212,12 +235,13 @@
   function returnToBatches(p, taken, qty, wh) {
     p.batches = p.batches || [];
     if (!taken || !taken.length) { addBatch(p, { qty, prodDate: null, useBy: null, wh }); return; }
-    for (const t of taken) { const b = p.batches.find(x => x.id === t.id); if (b) b.qty = round3(b.qty + t.qty); else p.batches.push({ id: t.id, qty: t.qty, useBy: t.useBy, prodDate: t.prodDate, receivedAt: Date.now(), wh }); }
+    for (const t of taken) { const b = p.batches.find(x => x.id === t.id); if (b) b.qty = round3(b.qty + t.qty); else p.batches.push({ id: t.id, qty: t.qty, useBy: t.useBy, prodDate: t.prodDate, lotNo: t.lotNo || null, receivedAt: Date.now(), wh }); }
   }
   /** Rozdíl trvanlivosti a vah u řádku dokladu (pro zobrazení). */
   const lineInfo = (i) => [
     i.weights && i.weights.length > 1 ? 'váhy ' + i.weights.map(fmtQty).join(' + ') : '',
     i.useBy ? 'spotřeba do ' + fmtDay(i.useBy) : '',
+    i.lotNo ? 'šarže ' + i.lotNo : '',
     i.lot ? 'vybraná trvanlivost ' + lotLabel(i.lot.useBy) : '',
     i.batches && i.batches.some(b => b.useBy) ? 'šarže ' + [...new Set(i.batches.filter(b => b.useBy).map(b => fmtDay(b.useBy)))].join(', ') : '',
     i.manual ? 'bez skenu' : '',
@@ -240,12 +264,12 @@
       // Přesunuté šarže si nechají datum výroby i trvanlivost.
       const taken = takeFromBatches(p, qty, wh); line.batches = taken;
       const toBefore = stockOf(p, whTo); let moved = 0;
-      taken.forEach(t => { addBatch(p, { qty: t.qty, prodDate: t.prodDate, useBy: t.useBy, wh: whTo }); moved = round3(moved + t.qty); });
+      taken.forEach(t => { addBatch(p, { qty: t.qty, prodDate: t.prodDate, useBy: t.useBy, lotNo: t.lotNo || null, wh: whTo }); moved = round3(moved + t.qty); });
       if (moved < qty) addBatch(p, { qty: round3(qty - moved), prodDate: null, useBy: null, wh: whTo });
       setStockOf(p, whTo, toBefore + qty);
       Object.assign(line, { whTo, toBefore, toAfter: round3(toBefore + qty) });
     }
-    else if (diff > 0) { const b = { qty: diff, prodDate: it.prodDate || null, useBy: it.useBy || null, wh }; addBatch(p, b); line.prodDate = b.prodDate; line.useBy = b.useBy; }
+    else if (diff > 0) { const b = { qty: diff, prodDate: it.prodDate || null, useBy: it.useBy || null, lotNo: it.lotNo || null, wh }; addBatch(p, b); line.prodDate = b.prodDate; line.useBy = b.useBy; if (b.lotNo) line.lotNo = b.lotNo; }
     else if (diff < 0) { line.batches = takeFromBatches(p, -diff, wh, it.lot || null); if (it.lot) line.lot = it.lot; }
     if (it.weights) line.weights = it.weights;
     if (it.prodDate) p.lastProdDate = it.prodDate;
@@ -272,19 +296,136 @@
   };
 
   // ---------- Skener ----------
+  /** Text ze čtečky → jednotný tvar: GS1 etikety jako „(01)…(15)…(10)…“, ostatní kódy beze změny.
+   *  Opraví i číslice z USB čtečky na české klávesnici (+ěščřžýáíé → 1234567890). */
+  const CZ_DIGITS = { '+': '1', 'ě': '2', 'š': '3', 'č': '4', 'ř': '5', 'ž': '6', 'ý': '7', 'á': '8', 'í': '9', 'é': '0' };
+  function cleanScan(text) {
+    let t = String(text ?? '').replace(/[\r\n]/g, '').trim();
+    if (/[ěščřžýáíé]/.test(t)) t = t.replace(/[+ěščřžýáíé]/g, c => CZ_DIGITS[c]);
+    const g = window.GS1 && GS1.parse(t);
+    if (g) return g.hri;
+    return normCode(t.replace(/^\][A-Za-z]\d/, '').replace(/\x1D/g, ''));
+  }
+  const gs1Of = (code) => (window.GS1 ? GS1.parse(code) : null);
+  /** Krátký popis toho, co etiketa říká (pro hlášky). */
+  const gs1Info = (g) => g ? [g.useBy ? 'do ' + fmtDay(g.useBy) : '', g.lot ? 'šarže ' + g.lot : '', g.netKg ? fmtQty(g.netKg) + ' kg' : '', g.count && g.contentGtin ? g.count + ' bal.' : ''].filter(Boolean).join(' · ') : '';
+
+  /** Dekodér ZXing-C++ (WebAssembly) – čte i dlouhé GS1-128 kódy z kartonů a palet. Načte se při prvním skenu. */
+  const zx = {
+    ready: null,
+    load() {
+      if (this.ready) return this.ready;
+      if (!window.ZXingWASM || typeof WebAssembly === 'undefined') return (this.ready = Promise.resolve(false));
+      ZXingWASM.prepareZXingModule({ overrides: { locateFile: (path, prefix) => (path.endsWith('.wasm') ? new URL('vendor/' + path, location.href).href : prefix + path) } });
+      // Prázdný obrázek = načtení a zahřátí modulu.
+      this.ready = ZXingWASM.readBarcodes(new ImageData(8, 8), { formats: ['Code128'] }).then(() => true, (e) => { console.warn('ZXing', e); return false; });
+      return this.ready;
+    },
+    async read(imageData) {
+      const r = await ZXingWASM.readBarcodes(imageData, { formats: ['Code128', 'EAN-13', 'EAN-8', 'UPC-A', 'UPC-E', 'ITF', 'Code39', 'DataMatrix', 'QRCode', 'DataBar', 'DataBarExpanded'], tryHarder: true, maxNumberOfSymbols: 4, textMode: 'HRI' });
+      return r.filter(b => b.isValid !== false && b.text).map(b => b.text);
+    }
+  };
+
   const scanner = {
-    html5: null, running: false, onCode: null, lastCode: null, lastAt: 0,
-    async open(title, onCode) {
+    running: false, paused: false, onCode: null, lastCode: null, lastSeen: 0,
+    stream: null, video: null, track: null, native: null, timer: null, html5: null, engine: '', zoomIdx: 0,
+    async open(title, onCode, { ignoreCode = null } = {}) {
       this.onCode = onCode;
       $('#scanTitle').textContent = title;
       $('#scanLast').textContent = ''; $('#scanLast').className = 'scan-last';
       $('#scanManual').value = '';
       $('#scanModal').classList.remove('hidden'); raiseLayer($('#scanModal'));
+      this.lastCode = ignoreCode; this.lastSeen = Date.now(); // ignoreCode: etiketa, která už je započtená a může být ještě v záběru
       await this.start();
     },
     async start() {
       if (this.running) return;
+      const reader = $('#reader');
+      reader.innerHTML = `<div class="cam-wrap"><video playsinline muted autoplay></video><div class="scan-guide"><span></span></div>
+        <div class="cam-tools"><button type="button" class="camtool hidden" id="camTorch" title="Svítilna">🔦</button><button type="button" class="camtool hidden" id="camZoom" title="Přiblížit">1×</button></div>
+        <div class="cam-hint" id="camHint">Načítám čtečku…</div></div>`;
       try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('Prohlížeč nepovoluje kameru (je potřeba https).');
+        const [stream, zxOk] = await Promise.all([
+          navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } }),
+          zx.load()
+        ]);
+        if ($('#scanModal').classList.contains('hidden')) { stream.getTracks().forEach(t => t.stop()); return; } // mezitím zavřeno
+        this.stream = stream; this.track = stream.getVideoTracks()[0];
+        try { await this.track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }); } catch (_) {}
+        this.video = $('video', reader); this.video.srcObject = stream;
+        await this.video.play().catch(() => {});
+        // Nativní čtečka (Android Chrome) je rychlá; ZXing-C++ běží všude a jistí ji.
+        this.native = null;
+        if ('BarcodeDetector' in window) {
+          try {
+            const sup = await BarcodeDetector.getSupportedFormats();
+            const want = ['code_128', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'itf', 'code_39', 'data_matrix', 'qr_code'].filter(f => sup.includes(f));
+            if (want.includes('code_128')) this.native = new BarcodeDetector({ formats: want });
+          } catch (_) {}
+        }
+        if (!this.native && !zxOk) { this.stopStream(); return this.startHtml5(); }
+        this.engine = [this.native ? 'nativní' : '', zxOk ? 'ZXing' : ''].filter(Boolean).join(' + ');
+        this.running = true; this.paused = false; this.tick = 0;
+        this.setupTools();
+        $('#camHint').textContent = 'Namiř na čárový kód – celý kód ať je v rámečku';
+        this.loop(zxOk);
+      } catch (err) {
+        this.stopStream();
+        reader.innerHTML = `<div class="empty" style="color:#fff"><div class="big">📷</div>Kameru nelze spustit.<br><span class="small">${esc(err && err.message || err)}</span><br><span class="small">Zadej kód ručně níže, nebo použij USB/Bluetooth čtečku.</span></div>`;
+      }
+    },
+    setupTools() {
+      const caps = (this.track && this.track.getCapabilities) ? this.track.getCapabilities() : {};
+      const torch = $('#camTorch');
+      if (caps.torch) { let on = false; torch.classList.remove('hidden'); torch.onclick = async () => { on = !on; try { await this.track.applyConstraints({ advanced: [{ torch: on }] }); torch.classList.toggle('on', on); } catch (_) {} }; }
+      const zoom = $('#camZoom');
+      if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+        const steps = [Math.max(1, caps.zoom.min), 2, 3].filter((z, i, a) => z <= caps.zoom.max && a.indexOf(z) === i);
+        if (steps.length > 1) { zoom.classList.remove('hidden'); this.zoomIdx = 0; zoom.onclick = async () => { this.zoomIdx = (this.zoomIdx + 1) % steps.length; try { await this.track.applyConstraints({ advanced: [{ zoom: steps[this.zoomIdx] }] }); zoom.textContent = steps[this.zoomIdx] + '×'; } catch (_) {} }; }
+      }
+    },
+    loop(zxOk) {
+      const canvas = this.canvas || (this.canvas = document.createElement('canvas'));
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      let nativeMisses = 0;
+      const step = async () => {
+        if (!this.running) return;
+        const v = this.video;
+        if (!this.paused && v && v.readyState >= 2 && v.videoWidth) {
+          try {
+            let texts = [];
+            if (this.native) {
+              const r = await this.native.detect(v);
+              texts = r.map(b => b.rawValue).filter(Boolean);
+              nativeMisses = texts.length ? 0 : nativeMisses + 1;
+            }
+            // ZXing: bez nativní čtečky pokaždé, s ní jen když dlouho nic nenašla (každý 3. snímek).
+            if (!texts.length && zxOk && (!this.native || (nativeMisses > 4 && nativeMisses % 3 === 0))) {
+              // Střed obrazu (rámeček): celá šířka, 60 % výšky; max. 1600 px pro rychlost.
+              const vw = v.videoWidth, vh = v.videoHeight;
+              const ch = Math.round(vh * (vw > vh ? 0.8 : 0.6)), cy = Math.round((vh - ch) / 2);
+              const scale = Math.min(1, 1600 / Math.max(vw, ch));
+              canvas.width = Math.round(vw * scale); canvas.height = Math.round(ch * scale);
+              ctx.drawImage(v, 0, cy, vw, ch, 0, 0, canvas.width, canvas.height);
+              texts = await zx.read(ctx.getImageData(0, 0, canvas.width, canvas.height));
+            }
+            if (texts.length && this.running && !this.paused) {
+              // Na paletě jsou dva kódy: přednost má ten se zbožím (GTIN), ne samotné SSCC.
+              const best = texts.map(cleanScan).sort((a, b) => { const ga = gs1Of(a), gb = gs1Of(b); return (gb && gb.gtin ? 1 : 0) - (ga && ga.gtin ? 1 : 0); })[0];
+              this.handle(best, true);
+            }
+          } catch (e) { console.warn('scan', e); }
+        }
+        this.timer = setTimeout(step, this.native ? 90 : 60);
+      };
+      step();
+    },
+    /** Záložní čtečka pro staré prohlížeče (bez WebAssembly). */
+    async startHtml5() {
+      try {
+        $('#reader').innerHTML = '';
         this.html5 = this.html5 || new Html5Qrcode('reader', {
           formatsToSupport: [
             Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8, Html5QrcodeSupportedFormats.CODE_128,
@@ -293,36 +434,100 @@
           ],
           experimentalFeatures: { useBarCodeDetectorIfSupported: true }, verbose: false
         });
-        await this.html5.start(
-          { facingMode: 'environment' },
-          { fps: 10, qrbox: (w, h) => ({ width: Math.min(w * 0.9, 420), height: Math.min(h * 0.5, 180) }), aspectRatio: 1.5 },
-          (text) => this.handle(text), () => {}
-        );
-        this.running = true;
+        await this.html5.start({ facingMode: 'environment' },
+          { fps: 10, qrbox: (w, h) => ({ width: Math.floor(w * 0.95), height: Math.floor(Math.min(h * 0.6, 220)) }), aspectRatio: 1.5, videoConstraints: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } } },
+          (text) => { if (!this.paused) this.handle(cleanScan(text), true); }, () => {});
+        this.running = true; this.paused = false; this.engine = 'html5-qrcode';
       } catch (err) {
         $('#reader').innerHTML = `<div class="empty" style="color:#fff"><div class="big">📷</div>Kameru nelze spustit.<br><span class="small">${esc(err && err.message || err)}</span><br><span class="small">Zadej kód ručně níže.</span></div>`;
       }
     },
-    handle(text) {
-      const code = normCode(text); const now = Date.now();
-      if (code === this.lastCode && now - this.lastAt < 1500) return; // ochrana proti opakovanému čtení
-      this.lastCode = code; this.lastAt = now;
+    /** Zpracuje přečtený kód. Z kamery: stejný kód se znovu přijme až poté, co zmizí ze záběru (další karton se stejnou etiketou). */
+    handle(text, fromCamera = false) {
+      const code = cleanScan(text); if (!code) return;
+      const now = Date.now();
+      if (fromCamera && code === this.lastCode && now - this.lastSeen < 1300) { this.lastSeen = now; return; }
+      this.lastCode = code; this.lastSeen = now;
+      const g = gs1Of(code);
+      if (g && !g.gtin) {
+        // Samotné SSCC (00) – číslo palety, neříká co je uvnitř.
+        const msg = g.sscc ? `Kód palety SSCC ${g.sscc} – naskenuj druhý kód se zbožím (02)/(01)` : `Etiketa bez kódu zboží: ${code}`;
+        if (!$('#scanModal').classList.contains('hidden')) this.feedback(msg, false); else toast(msg, 3500);
+        return;
+      }
       if (this.onCode) this.onCode(code);
     },
     feedback(msg, ok) {
+      if ($('#scanModal').classList.contains('hidden')) { beep(ok); toast(msg, 3000); return; }
       const el = $('#scanLast'); el.textContent = msg; el.className = 'scan-last ' + (ok ? 'ok' : 'bad'); beep(ok);
+      if (ok && navigator.vibrate) navigator.vibrate(60);
     },
-    async pause() { if (this.running && this.html5) { try { this.html5.pause(true); } catch (_) {} } },
-    async resume() { if (this.running && this.html5) { try { this.html5.resume(); } catch (_) {} } },
+    async pause() { this.paused = true; if (this.html5 && this.engine === 'html5-qrcode') { try { this.html5.pause(true); } catch (_) {} } },
+    async resume() { this.paused = false; this.lastSeen = Date.now(); if (this.html5 && this.engine === 'html5-qrcode') { try { this.html5.resume(); } catch (_) {} } },
+    stopStream() {
+      clearTimeout(this.timer); this.timer = null;
+      if (this.stream) { this.stream.getTracks().forEach(t => { try { t.stop(); } catch (_) {} }); }
+      this.stream = null; this.track = null; if (this.video) { this.video.srcObject = null; this.video = null; }
+    },
     async close() {
       $('#scanModal').classList.add('hidden'); $('#scanModal').style.zIndex = '';
-      if (this.html5 && this.running) { try { await this.html5.stop(); } catch (_) {} }
-      this.running = false; this.onCode = null;
+      this.stopStream();
+      if (this.html5 && this.engine === 'html5-qrcode' && this.running) { try { await this.html5.stop(); } catch (_) {} }
+      this.running = false; this.paused = false; this.onCode = null; this.engine = '';
     }
   };
   $('#scanClose').onclick = () => scanner.close();
   $('#scanManualBtn').onclick = () => { const v = $('#scanManual').value; if (v.trim()) { scanner.handle(v); $('#scanManual').value = ''; } };
   $('#scanManual').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#scanManualBtn').click(); } };
+
+  // ---------- Externí čtečka (USB / Bluetooth, režim klávesnice) ----------
+  /* Čtečka „píše“ kód jako klávesnice velmi rychle a končí Enterem (nebo Tabem). Takové rychlé sekvence se
+   * zachytí kdekoli v aplikaci a pošlou tam, kam by šel sken z kamery: otevřený skener, okno (vážení),
+   * nebo aktuální obrazovka (příjem, výdej, inventura, objednávka…). Oddělovač GS1 (FNC1) čtečky posílají jako Ctrl+]. */
+  let pageScan = null;   // obsluha skenu aktuální obrazovky (nastavují obrazovky, render() ji maže)
+  let dialogScan = null; // obsluha skenu v otevřeném okně (např. vážení kartonů)
+  function routeScan(raw) {
+    const code = cleanScan(raw); if (!code) return;
+    if (!$('#scanModal').classList.contains('hidden')) return scanner.handle(code);
+    if (!$('#errScreen').classList.contains('hidden')) { beep(false); return; }
+    const g = gs1Of(code);
+    if (g && !g.gtin) return scanner.handle(code); // jen hláška o SSCC
+    const dlgOpen = $$('.modal').some(m => m.id !== 'scanModal' && !m.classList.contains('hidden'));
+    if (dlgOpen) { if (dialogScan) dialogScan(code); else { beep(false); toast('Nejdřív dokonči otevřené okno, pak skenuj.'); } return; }
+    (pageScan || quickScanHandle)(code);
+  }
+  const wedge = { buf: '', t: 0, timer: null, field: null, before: '' };
+  const isGsKey = (e) => e.key === '\x1D' || e.key === 'GroupSeparator' || (e.ctrlKey && (e.key === ']' || e.code === 'BracketRight'));
+  document.addEventListener('keydown', (e) => {
+    const t = e.target;
+    const tag = t && t.tagName;
+    const editable = t && (t.isContentEditable || tag === 'TEXTAREA' || tag === 'SELECT' || (tag === 'INPUT' && !['button', 'submit', 'checkbox', 'radio'].includes(t.type)));
+    // Do textových polí (kód produktu, hledání, ruční zadání) čtečka normálně píše; GS se vloží jako znak.
+    const textField = editable && !(tag === 'INPUT' && ['number', 'date'].includes(t.type));
+    if (textField) {
+      if (isGsKey(e) && tag === 'INPUT') { e.preventDefault(); const a = t.selectionStart ?? t.value.length; t.value = t.value.slice(0, a) + '\x1D' + t.value.slice(t.selectionEnd ?? a); }
+      return;
+    }
+    const now = performance.now();
+    if (now - wedge.t > 60) { wedge.buf = ''; wedge.field = editable ? t : null; wedge.before = editable ? t.value : ''; }
+    wedge.t = now;
+    const fire = () => {
+      clearTimeout(wedge.timer); const code = wedge.buf; wedge.buf = '';
+      if (wedge.field) { try { wedge.field.value = wedge.before; } catch (_) {} } // číslo z kódu nepatří do pole s množstvím
+      routeScan(code);
+    };
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      if (wedge.buf.length >= 4) { e.preventDefault(); e.stopPropagation(); fire(); }
+      else wedge.buf = '';
+      return;
+    }
+    if (isGsKey(e)) { e.preventDefault(); wedge.buf += '\x1D'; return; }
+    if (e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      wedge.buf += e.key;
+      clearTimeout(wedge.timer);
+      wedge.timer = setTimeout(() => { if (wedge.buf.length >= 8 && performance.now() - wedge.t < 200) fire(); else wedge.buf = ''; }, 150); // čtečka bez Enteru
+    }
+  }, true);
 
   // ---------- Formulář produktu ----------
   async function productForm(product = {}, { codeLocked = false } = {}) {
@@ -412,25 +617,32 @@
 
   /** Neznámý kód při skenu: založit nový produkt, nebo kód uložit jako balení (karton) existujícího produktu. Vrací {p, pack} nebo null. */
   async function resolveUnknownCode(code) {
+    const g = gs1Of(code);
+    if (g && !g.gtin) { toast('Tento kód neobsahuje kód zboží (GTIN) – naskenuj jiný kód na etiketě.', 3500); return null; }
+    const key = g ? g.gtin : code; // z etikety kartonu se uloží jen GTIN (bez data a šarže)
     const r = await dialog(`
       <div class="modal-head"><strong>Neznámý kód</strong><button class="iconbtn" data-close>✕</button></div>
-      <p style="margin-top:0">Kód <span class="mono">${esc(code)}</span> v databázi není. Co to je?</p>
+      <p style="margin-top:0">${g ? `Etiketa kartonu/palety s kódem zboží <span class="mono">${esc(key)}</span>${gs1Info(g) ? ` <span class="muted small">(${esc(gs1Info(g))})</span>` : ''}` : `Kód <span class="mono">${esc(code)}</span>`} v databázi není. Co to je?</p>
       <div class="list">
         <button type="button" class="btn big" id="ucPack">📦 Karton / balení produktu, který už mám</button>
         <button type="button" class="btn secondary big" id="ucNew">＋ Nový produkt</button>
         <button type="button" class="btn secondary" data-close>Zrušit</button>
       </div>`, { onOpen(card, close) { $('#ucPack', card).onclick = () => close('pack'); $('#ucNew', card).onclick = () => close('new'); } });
-    if (r === 'pack') return registerPack(code);
-    if (r === 'new') { const p = await productForm({ code }, { codeLocked: true }); return p ? { p: productById(p.id) || p, pack: null } : null; }
-    return null;
+    let hit = null;
+    if (r === 'pack') hit = await registerPack(key, g);
+    if (r === 'new') { const p = await productForm({ code: key }, { codeLocked: true }); hit = p ? { p: productById(p.id) || p, pack: null } : null; }
+    if (hit && g) return lookupCode(code) || { ...hit, gs1: g };
+    return hit;
   }
   /** Uloží kód kartonu k vybranému produktu (kolik kusů je uvnitř). */
-  async function registerPack(code) {
+  async function registerPack(code, g = null) {
     const p = await pickProduct(); if (!p) return null;
+    const guess = g && g.netKg && isWeighed(p) ? (p.unit === 'g' ? g.netKg * 1000 : g.netKg) : '';
     const r = await dialog(`
       <div class="modal-head"><strong>📦 ${esc(p.name)}</strong><button class="iconbtn" data-close>✕</button></div>
       <form>
-        <div class="field"><label>Kolik ${esc(p.unit)} je v jednom balení s kódem <span class="mono">${esc(code)}</span>?</label><input name="qty" type="number" step="any" min="0" inputmode="decimal" placeholder="např. 12" required></div>
+        <div class="field"><label>Kolik ${esc(p.unit)} je v jednom balení s kódem <span class="mono">${esc(code)}</span>?</label><input name="qty" type="number" step="any" min="0" inputmode="decimal" placeholder="např. 12" value="${guess}" required></div>
+        ${g && g.contentGtin ? `<p class="muted small">Naskenovaná paleta obsahuje ${g.count || '?'} těchto balení – zadej, kolik ${esc(p.unit)} je v <strong>jednom</strong> balení (kartonu).</p>` : ''}
         <div class="row" style="justify-content:flex-end"><button type="button" class="btn secondary" data-close>Zrušit</button><button type="submit" class="btn">Uložit balení</button></div>
       </form>`);
     if (!r) return null;
@@ -444,7 +656,7 @@
 
   /** Dotaz na množství. S `dates: true` (příjem) navíc datum výroby a trvanlivost a vrací objekt {qty, prodDate, useBy}.
    *  S `pack` (naskenovaný karton) je navíc pole „Počet balení“, které dopočítá celkové množství. */
-  async function qtyDialog(product, { title, defaultQty = 1, extraHtml = '', dates = false, prodDate = '', useBy = '', wh = state.wh, pack = null, packsDefault = 1, lots = null } = {}) {
+  async function qtyDialog(product, { title, defaultQty = 1, extraHtml = '', dates = false, prodDate = '', useBy = '', lotNo = '', wh = state.wh, pack = null, packsDefault = 1, lots = null } = {}) {
     const res = await dialog(`
       <div class="modal-head"><strong>${esc(title || product.name)}</strong><button class="iconbtn" data-close>✕</button></div>
       <div class="muted mono" style="margin-bottom:8px">${esc(product.code)} · skladem ${fmtQty(stockOf(product, wh))} ${esc(product.unit)} ${whBadge(wh)}</div>
@@ -459,7 +671,8 @@
         ${dates ? `<div class="grid2">
           <div class="field"><label>Datum výroby</label><input name="prodDate" type="date" value="${esc(prodDate)}"></div>
           <div class="field"><label>Spotřebujte do${product.shelfLifeDays ? ` (výroba + ${product.shelfLifeDays} dní)` : ''}</label><input name="useBy" type="date" value="${esc(useBy)}"></div>
-        </div>` : ''}
+        </div>
+        <div class="field"><label>Šarže / LOT</label><input name="lotNo" value="${esc(lotNo)}" placeholder="volitelné" autocomplete="off"></div>` : ''}
         <div class="row" style="justify-content:flex-end">
           <button type="button" class="btn secondary" data-close>Zrušit</button>
           <button type="submit" class="btn">OK</button>
@@ -477,19 +690,20 @@
     const q = Number(res.qty);
     if (!Number.isFinite(q)) return null;
     if (lots) return { qty: q, lot: lotFromVal(res.lot || '') };
-    return dates ? { qty: q, prodDate: res.prodDate || null, useBy: res.useBy || null } : q;
+    return dates ? { qty: q, prodDate: res.prodDate || null, useBy: res.useBy || null, lotNo: (res.lotNo || '').trim() || null } : q;
   }
 
   /** Vážené zboží (kg): skladník zapíše váhu každého kusu, součet jde do objednávky. */
-  function weighDialog(p, orderedQty, previous, extraHtml = '') {
-    return new Promise((resolve) => {
+  function weighDialog(p, orderedQty, previous, extraHtml = '', firstCode = null) {
+    return new Promise((resolve0) => {
+      const resolve = (v) => { dialogScan = null; if (!$('#scanModal').classList.contains('hidden')) scanner.close(); resolve0(v); };
       let weights = previous && previous.length ? previous.map(String) : [''];
       dialog(`
         <div class="modal-head"><strong>⚖️ Zvaž: ${esc(p.name)}</strong><button class="iconbtn" data-close>✕</button></div>
         <p class="muted small" style="margin-top:0">Objednáno <strong>${fmtQty(orderedQty)} ${esc(p.unit)}</strong>. Zapiš váhu každého kusu, součet se zapíše do objednávky.</p>
         ${extraHtml}
         <div id="wRows" class="list"></div>
-        <div class="row" style="margin-top:10px"><button type="button" class="btn secondary sm" id="wAdd">＋ Další kus</button><span class="grow"></span><div>Celkem <strong id="wTotal">0</strong> ${esc(p.unit)}</div></div>
+        <div class="row" style="margin-top:10px"><button type="button" class="btn secondary sm" id="wAdd">＋ Další kus</button><button type="button" class="btn secondary sm" id="wScan" title="Váha se načte z etikety kartonu (GS1)">📷 Váhy z etiket</button><span class="grow"></span><div>Celkem <strong id="wTotal">0</strong> ${esc(p.unit)}</div></div>
         <div class="row" style="justify-content:flex-end;margin-top:12px"><button type="button" class="btn secondary" data-close>Zrušit</button><button type="button" class="btn" id="wOk">OK</button></div>`, {
         onOpen(card, close) {
           const num = (w) => Number(String(w).replace(',', '.')) || 0;
@@ -506,6 +720,19 @@
           };
           draw(true);
           $('#wAdd', card).onclick = () => { weights.push(''); draw(true); };
+          // Sken etikety kartonu s váhou (310n) přidá kus s touto váhou – kamerou i externí čtečkou.
+          const addKg = (code) => {
+            const hit = lookupCode(code);
+            if (!hit || hit.p.id !== p.id) { scanner.feedback(hit ? `To je ${hit.p.name}, ne ${p.name}!` : `Neznámý kód ${code}`, false); return; }
+            if (!hit.gs1 || !hit.gs1.netKg) { scanner.feedback('Na etiketě není váha – zapiš ji ručně', false); return; }
+            const kg = gs1Qty(hit);
+            const emptyIdx = weights.findIndex(w => !num(w));
+            if (emptyIdx >= 0) weights[emptyIdx] = String(kg); else weights.push(String(kg));
+            draw(false);
+            scanner.feedback(`✓ +${fmtQty(kg)} ${p.unit} · ${weights.filter(w => num(w)).length} ks · celkem ${fmtQty(total())} ${p.unit}`, true);
+          };
+          dialogScan = addKg;
+          $('#wScan', card).onclick = () => scanner.open(`Váhy z etiket: ${p.name}`, addKg, { ignoreCode: firstCode });
           $('#wOk', card).onclick = () => {
             const ws = weights.map(num).filter(w => w > 0);
             if (!ws.length) return toast('Zapiš aspoň jednu váhu');
@@ -527,6 +754,7 @@
     document.body.classList.toggle('print-label', path === '/stitek' || path === '/faktura');
     $$('[data-route]').forEach(a => a.classList.toggle('active', a.dataset.route === path));
     $('#sidenav').classList.remove('open'); $('#backdrop').classList.remove('open');
+    pageScan = null;
     await fn($('#view'), params);
   }
   window.addEventListener('hashchange', render);
@@ -631,7 +859,7 @@
     $$('.chip', el).forEach(c => c.onclick = () => { prodFilter.cat = c.dataset.cat; render(); });
     $('#prodAdd').onclick = async () => { if (await productForm()) render(); };
     $('#prodScan').onclick = () => scanner.open('Najít produkt', async (code) => {
-      const p = productByCode(code);
+      const p = (lookupCode(code) || {}).p;
       if (p) { scanner.feedback(`${p.name}`, true); await scanner.close(); location.hash = `#/produkt?id=${p.id}`; }
       else { scanner.feedback(`Neznámý kód ${code}`, false); await scanner.close(); const hit = await resolveUnknownCode(code); if (hit) { location.hash = `#/produkt?id=${hit.p.id}`; render(); } }
     });
@@ -668,8 +896,8 @@
         </div>
       </div>
       <div class="card"><h2>Šarže na skladě</h2>
-        ${(() => { const bs = sortedBatches(p, null); return bs.length ? `<div class="table-wrap"><table><tr><th>Sklad</th><th>Datum výroby</th><th>Spotřebujte do</th><th class="num">Množství</th></tr>
-          ${bs.map(b => `<tr><td>${whBadge(b.wh)}</td><td>${fmtDay(b.prodDate) || '<span class="muted">—</span>'}</td><td>${b.useBy ? fmtDay(b.useBy) + ' ' + expiryBadge(b.useBy) : '<span class="muted">—</span>'}</td><td class="num">${fmtQty(b.qty)} ${esc(p.unit)}</td></tr>`).join('')}
+        ${(() => { const bs = sortedBatches(p, null); return bs.length ? `<div class="table-wrap"><table><tr><th>Sklad</th><th>Datum výroby</th><th>Spotřebujte do</th><th>Šarže</th><th class="num">Množství</th></tr>
+          ${bs.map(b => `<tr><td>${whBadge(b.wh)}</td><td>${fmtDay(b.prodDate) || '<span class="muted">—</span>'}</td><td>${b.useBy ? fmtDay(b.useBy) + ' ' + expiryBadge(b.useBy) : '<span class="muted">—</span>'}</td><td class="mono small">${b.lotNo ? esc(b.lotNo) : '<span class="muted">—</span>'}</td><td class="num">${fmtQty(b.qty)} ${esc(p.unit)}</td></tr>`).join('')}
         </table></div><p class="muted small">Vydává se nejdřív zboží s nejkratší trvanlivostí.</p>` : '<div class="empty small">Zatím žádné šarže. Data výroby a trvanlivost zadáš při příjmu.</div>'; })()}
       </div>
       <div class="card"><h2>Historie pohybů</h2>
@@ -705,6 +933,13 @@
       const whTo = () => otherWh(whFrom());
       const save = () => drafts.set(key, draft);
 
+      /** Přidá řádek do dokladu; stejný produkt se stejnou trvanlivostí a šarží se přičte. */
+      const addRow = async (p, q, pd, ub, ln) => {
+        let row = draft.items.find(i => i.productId === p.id && (i.prodDate || null) === pd && (i.useBy || null) === ub && (i.lotNo || null) === ln);
+        if (row) row.qty = round3(Number(row.qty) + q); else { row = { productId: p.id, qty: q, prodDate: pd, useBy: ub, lotNo: ln }; draft.items.unshift(row); }
+        await save(); draw();
+        return row;
+      };
       const addCode = async (code) => {
         const scanning = !$('#scanModal').classList.contains('hidden');
         let hit = lookupCode(code);
@@ -712,20 +947,29 @@
           if (scanning) { scanner.feedback(`Neznámý kód ${code}`, false); await scanner.close(); }
           hit = await resolveUnknownCode(code);
           if (!hit) return;
-        } else if (scanning) { scanner.feedback(`✓ ${hit.p.name}${hit.pack ? ' · ' + packLabel(hit.p, hit.pack) : ''}`, true); await scanner.pause(); }
-        const { p, pack } = hit;
+        }
+        const { p, pack } = hit; const g = hit.gs1 || null;
+        // Příjem z etikety kartonu / palety: množství, trvanlivost i šarže jsou v kódu → přidá se bez ptaní.
+        const autoQty = type === 'receipt' && g ? gs1Qty(hit) : null;
+        if (autoQty > 0) {
+          const pd = g.prodDate || null, ub = g.useBy || (g.prodDate && p.shelfLifeDays ? addDays(g.prodDate, Number(p.shelfLifeDays)) : null), ln = g.lot || null;
+          const row = await addRow(p, autoQty, pd, ub, ln);
+          const msg = `✓ ${p.name}: +${fmtQty(autoQty)} ${p.unit}${gs1Info(g) ? ' · ' + gs1Info(g) : ''} · celkem ${fmtQty(row.qty)} ${p.unit}`;
+          if (!$('#scanModal').classList.contains('hidden')) scanner.feedback(msg, true); else { beep(true); toast(msg, 3000); }
+          return;
+        }
+        if (scanning) { scanner.feedback(`✓ ${p.name}${pack ? ' · ' + packLabel(p, pack) : ''}`, true); await scanner.pause(); }
         const existing = draft.items.filter(i => i.productId === p.id); const last = existing[0];
         const have = round3(existing.reduce((s, i) => s + Number(i.qty), 0));
-        const r = await qtyDialog(p, { title: `${labels.verb}: ${p.name}`, defaultQty: pack ? pack.qty : (state.settings.defaultQty || 1), wh: whFrom(), pack, packsDefault: 1,
-          extraHtml: have ? `<p class="muted small">V dokladu už je ${fmtQty(have)} ${esc(p.unit)} – zadané množství se přičte.</p>` : '',
-          dates: type === 'receipt', prodDate: last ? last.prodDate || '' : '', useBy: last ? last.useBy || '' : '' });
+        const gq = g ? gs1Qty(hit) : null;
+        const r = await qtyDialog(p, { title: `${labels.verb}: ${p.name}`, defaultQty: gq || (pack ? pack.qty : (state.settings.defaultQty || 1)), wh: whFrom(), pack, packsDefault: g && g.contentGtin && g.count ? g.count : 1,
+          extraHtml: (g ? `<p class="pack-note">🏷️ Etiketa: ${esc(gs1Info(g) || g.hri)}</p>` : '') + (have ? `<p class="muted small">V dokladu už je ${fmtQty(have)} ${esc(p.unit)} – zadané množství se přičte.</p>` : ''),
+          dates: type === 'receipt', prodDate: g && g.prodDate ? g.prodDate : (last ? last.prodDate || '' : ''), useBy: g && g.useBy ? g.useBy : (last ? last.useBy || '' : ''), lotNo: g && g.lot ? g.lot : '' });
         const q = r === null ? null : (typeof r === 'object' ? r.qty : r);
         if (q !== null && q > 0) {
-          const pd = typeof r === 'object' ? r.prodDate || null : null, ub = typeof r === 'object' ? r.useBy || null : null;
+          const pd = typeof r === 'object' ? r.prodDate || null : null, ub = typeof r === 'object' ? r.useBy || null : null, ln = typeof r === 'object' ? r.lotNo || null : null;
           // Stejný produkt se stejnými daty = jeden řádek (přičte se); jiné datum výroby / trvanlivosti = další řádek (jiná šarže).
-          let row = draft.items.find(i => i.productId === p.id && (i.prodDate || null) === pd && (i.useBy || null) === ub);
-          if (row) row.qty = round3(Number(row.qty) + q); else { row = { productId: p.id, qty: q, prodDate: pd, useBy: ub }; draft.items.unshift(row); }
-          await save(); draw();
+          const row = await addRow(p, q, pd, ub, ln);
           const nPacks = pack && q / pack.qty !== 1 && Number.isInteger(q / pack.qty) ? ` (${q / pack.qty} × ${fmtQty(pack.qty)})` : '';
           toast(`${p.name}: +${fmtQty(q)} ${p.unit}${nPacks} · celkem ${fmtQty(row.qty)} ${p.unit}`);
         }
@@ -743,7 +987,7 @@
           const p = productById(it.productId); if (!p) return '';
           const have = stockOf(p, whFrom()); const warn = type !== 'receipt' && have < it.qty;
           return `<div class="item">
-            <div class="grow"><div class="name">${esc(p.name)}</div><div class="code mono">${esc(p.code)} · skladem ${fmtQty(have)} ${esc(p.unit)} (${esc(whFrom())})${warn ? ' <span class="badge danger">nedostatek</span>' : ''}${it.useBy ? ' · spotřeba do ' + fmtDay(it.useBy) : ''}${it.prodDate ? ' · výroba ' + fmtDay(it.prodDate) : ''}</div></div>
+            <div class="grow"><div class="name">${esc(p.name)}</div><div class="code mono">${esc(p.code)} · skladem ${fmtQty(have)} ${esc(p.unit)} (${esc(whFrom())})${warn ? ' <span class="badge danger">nedostatek</span>' : ''}${it.useBy ? ' · spotřeba do ' + fmtDay(it.useBy) : ''}${it.prodDate ? ' · výroba ' + fmtDay(it.prodDate) : ''}${it.lotNo ? ' · šarže ' + esc(it.lotNo) : ''}</div></div>
             <div class="qty-ctl"><button data-dec="${idx}">−</button><input type="number" step="any" min="0" data-qty="${idx}" value="${it.qty}"><button data-inc="${idx}">+</button></div>
             <button class="iconbtn" data-del="${idx}" title="Odebrat">🗑</button>
           </div>`;
@@ -782,6 +1026,7 @@
       const whLink = $('#docWh'); if (whLink) whLink.onclick = (e) => { e.preventDefault(); $('#whBtn').click(); };
       const swap = $('#docSwap'); if (swap) swap.onclick = async () => { draft.from = whTo(); await save(); drawDir(); draw(); toast(`Přesun ${whFrom()} → ${whTo()}`); };
       $('#docScan').onclick = () => scanner.open(labels.scan, addCode);
+      pageScan = addCode;
       $('#docPick').onclick = async () => { const p = await pickProduct(); if (p) { await addCode(p.code); } };
       $('#docClear').onclick = async () => { if (draft.items.length && !await confirmDlg('Zahodit doklad', 'Rozpracovaný doklad bude smazán.', 'Zahodit', true)) return; draft = { items: [], partner: '', note: '', from: draft.from }; await drafts.clear(key); draw(); };
       $('#docCommit').onclick = async () => {
@@ -876,24 +1121,26 @@
     $('#invWh').onclick = (e) => { e.preventDefault(); $('#whBtn').click(); };
     $('#invMode').onclick = () => { plusOne = !plusOne; $('#invMode').textContent = plusOne ? '+1' : '#?'; toast(plusOne ? 'Režim: každý sken +1' : 'Režim: dotaz na množství'); };
     $('#invOnly').onchange = (e) => { onlyCounted = e.target.checked; draw(); };
-    $('#invScan').onclick = () => scanner.open('Inventura – skenuj zboží', async (code) => {
+    const invHandle = async (code) => {
       let hit = lookupCode(code);
       if (!hit) {
         scanner.feedback(`Neznámý kód ${code}`, false); await scanner.close();
         hit = await resolveUnknownCode(code);
         if (!hit) return;
       }
-      const { p, pack } = hit; const step = pack ? pack.qty : 1;
+      const { p, pack } = hit; const step = gs1Qty(hit) || (pack ? pack.qty : 1);
       const cur = draft.counts[p.id] || 0;
-      if (plusOne) { draft.counts[p.id] = round3(cur + step); scanner.feedback(`✓ ${p.name}: +${fmtQty(step)}${pack ? ' (balení)' : ''} → ${fmtQty(cur + step)} ${p.unit}`, true); }
+      if (plusOne) { draft.counts[p.id] = round3(cur + step); scanner.feedback(`✓ ${p.name}: +${fmtQty(step)}${pack || hit.gs1 ? ' (balení)' : ''} → ${fmtQty(round3(cur + step))} ${p.unit}`, true); }
       else {
         scanner.feedback(`✓ ${p.name}`, true); await scanner.pause();
-        const q = await qtyDialog(p, { title: `Spočteno: ${p.name}`, defaultQty: pack ? pack.qty : (cur || ''), pack, packsDefault: 1, extraHtml: cur ? `<p class="muted small">Zatím spočteno ${fmtQty(cur)} ${esc(p.unit)}; zadané množství se přičte.</p>` : '' });
+        const q = await qtyDialog(p, { title: `Spočteno: ${p.name}`, defaultQty: gs1Qty(hit) || (pack ? pack.qty : (cur || '')), pack, packsDefault: hit.gs1 && hit.gs1.contentGtin && hit.gs1.count ? hit.gs1.count : 1, extraHtml: cur ? `<p class="muted small">Zatím spočteno ${fmtQty(cur)} ${esc(p.unit)}; zadané množství se přičte.</p>` : '' });
         if (q !== null) draft.counts[p.id] = round3(cur + q);
         await scanner.resume();
       }
       await save(); draw();
-    });
+    };
+    $('#invScan').onclick = () => scanner.open('Inventura – skenuj zboží', invHandle);
+    pageScan = invHandle;
     $('#invZero').onclick = async () => {
       if (!await confirmDlg('Nespočtené = 0', 'Všem produktům bez zadaného počtu se nastaví spočteno 0. Hodí se pro úplnou inventuru.', 'Nastavit')) return;
       state.products.forEach(p => { if (draft.counts[p.id] === undefined) draft.counts[p.id] = 0; }); await save(); draw();
@@ -1151,14 +1398,21 @@
   }
 
   /** Po úspěšném skenu: u váženého zboží váhy kusů, jinak potvrzení množství. Pak vydání ze skladu. */
-  async function pickQty(o, itemId, manual = false, pack = null) {
+  async function pickQty(o, itemId, manual = false, pack = null, hit = null) {
     const it = o.items.find(i => i.id === itemId); const p = it && productById(it.productId); if (!p) return;
     let qty, weights = null;
     const lotNote = lotHint(p, o, it, true);
-    if (isWeighed(p)) { const r = await weighDialog(p, it.qty, it.weights, lotNote); if (!r) return; qty = r.total; weights = r.weights; }
+    const g = hit && hit.gs1;
+    const tag = g ? `<p class="pack-note">🏷️ Etiketa: ${esc(gs1Info(g) || g.hri)}</p>` : '';
+    if (isWeighed(p)) {
+      // Váha z etikety kartonu (310n) se předvyplní jako první kus; další kartony lze naskenovat přímo v okně.
+      const kg = g ? gs1Qty(hit) : null;
+      const prev = it.picked == null && kg ? [kg] : it.weights;
+      const r = await weighDialog(p, it.qty, prev, tag + lotNote, kg && g ? g.hri : null); if (!r) return; qty = r.total; weights = r.weights;
+    }
     else {
-      const packsDef = pack && Number.isInteger(it.qty / pack.qty) ? it.qty / pack.qty : '';
-      const q = await qtyDialog(p, { title: `Vydat: ${p.name}`, defaultQty: it.picked ?? it.qty, wh: o.wh, pack, packsDefault: packsDef, extraHtml: `<p class="muted small" style="margin-top:0">Objednáno <strong>${fmtQty(it.qty)} ${esc(p.unit)}</strong>. Potvrď, nebo uprav skutečně vydané množství.</p>${lotNote}` });
+      const packsDef = g && g.contentGtin && g.count ? g.count : pack && Number.isInteger(it.qty / pack.qty) ? it.qty / pack.qty : '';
+      const q = await qtyDialog(p, { title: `Vydat: ${p.name}`, defaultQty: it.picked ?? it.qty, wh: o.wh, pack, packsDefault: packsDef, extraHtml: `<p class="muted small" style="margin-top:0">Objednáno <strong>${fmtQty(it.qty)} ${esc(p.unit)}</strong>. Potvrď, nebo uprav skutečně vydané množství.</p>${tag}${lotNote}` });
       if (q === null || q <= 0) return; qty = q;
     }
     if (it.lot) {
@@ -1180,7 +1434,7 @@
         return pickScan(o, itemId);
       }
       scanner.feedback(`✓ ${p.name}${hit.pack ? ' · ' + packLabel(p, hit.pack) : ''}`, true); await scanner.close();
-      await pickQty(o, itemId, false, hit.pack);
+      await pickQty(o, itemId, false, hit.pack, hit);
     });
   }
   function drawBarcode(svg, text) {
@@ -1261,14 +1515,15 @@
     const bc = $('#ordBarcode', el); if (bc) drawBarcode(bc, o.no);
     const mv = $('#ordMv', el); if (mv) mv.onclick = (e) => { e.preventDefault(); showMovement(o.movementId); };
     const ed = $('#ordEdit', el); if (ed) ed.onclick = async () => { await orderForm(o); render(); };
-    const sc = $('#ordScan', el); if (sc) sc.onclick = () => scanner.open('Naskenuj zboží z objednávky', async (code) => {
+    const ordHandle = async (code, viaCam = false) => {
       const hit = lookupCode(code); const p = hit && hit.p;
       const it = p ? (o.items.find(i => i.productId === p.id && i.picked == null) || o.items.find(i => i.productId === p.id)) : null;
       await scanner.close();
-      if (!it) { await wrongProductScreen(null, p, code); return sc.onclick(); }
-      scanner.feedback(`✓ ${p.name}`, true);
-      await pickQty(o, it.id, false, hit.pack);
-    });
+      if (!it) { await wrongProductScreen(null, p, code); if (viaCam) sc.onclick(); return; }
+      beep(true);
+      await pickQty(o, it.id, false, hit.pack, hit);
+    };
+    const sc = $('#ordScan', el); if (sc) { sc.onclick = () => scanner.open('Naskenuj zboží z objednávky', (c) => ordHandle(c, true)); pageScan = (c) => ordHandle(c, false); }
     const cn = $('#ordCancel', el); if (cn) cn.onclick = async () => {
       if (picked.length && !await confirmDlg('Zrušit objednávku', `${picked.length} položek už je vydaných. Vrátí se zpět na sklad a objednávka se zruší.`, 'Vrátit a zrušit', true)) return;
       if (!picked.length && !await confirmDlg('Zrušit objednávku', 'Objednávka se označí jako zrušená.', 'Zrušit objednávku', true)) return;
@@ -1490,6 +1745,12 @@
           <div class="field"><label>Výchozí množství při skenu</label><input id="setDefQty" type="number" step="any" min="0" value="${esc(state.settings.defaultQty || 1)}"></div>
         </div>
       </div>
+      <div class="card"><h2>Čtečka čárových kódů</h2>
+        <p class="muted small" style="margin-top:0">📷 <strong>Kamera</strong> čte EAN i dlouhé kódy GS1-128 z kartonů a palet. Z etikety se načte zboží, trvanlivost (15/17), šarže (10), váha (310x) a počet balení na paletě (37). U kódu na kartonu namiř tak, aby byl celý kód v rámečku; ve tmě zapni 🔦.<br>
+        🔌 <strong>Externí čtečka</strong> (USB nebo Bluetooth, režim klávesnice) funguje bez nastavení: naskenuj kdekoli v aplikaci a kód jde tam, kam by šel sken z kamery. Doporučené nastavení čtečky: rozložení klávesnice US, za kódem Enter, FNC1 posílat jako GS (Ctrl+]).</p>
+        <div class="row"><input id="scanTest" placeholder="Vyzkoušej: naskenuj sem kód čtečkou" autocomplete="off" class="grow"><button class="btn secondary" id="scanTestBtn">Rozbor</button></div>
+        <div id="scanTestOut" class="small mono" style="margin-top:8px;white-space:pre-wrap"></div>
+      </div>
       <div class="card"><h2>Produkty – hromadně</h2>
         <p class="muted small">CSV se sloupci: <span class="mono">kod;nazev;jednotka;kategorie;minimum;umisteni;dodavatel;cena;cena_eur;dph;stav_cz;stav_sk;baleni</span> (balení = <span class="mono">kód=kusů</span>, více oddělených mezerou) (první řádek hlavička, oddělovač ; nebo ,). Existující kódy se aktualizují, nové se založí; stavy se nastaví jen novým produktům (sloupec <span class="mono">stav</span> = sklad, ve kterém právě pracuješ).</p>
         <div class="row"><button class="btn secondary" id="csvExport">⬇ Export produktů (CSV)</button><button class="btn secondary" id="csvImport">⬆ Import produktů (CSV)</button><button class="btn secondary" id="csvTemplate">Vzor CSV</button></div>
@@ -1521,6 +1782,14 @@
       await DB.importAll({ products, movements, orders }, { replace: false }); await loadAll(); toast('Nahráno'); render();
     };
     $('#setWh').onchange = (e) => { setWh(e.target.value); toast(`Zařízení pracuje ve skladu ${whName(e.target.value)}`); };
+    const showScanTest = (raw) => {
+      const code = cleanScan(raw); const g = gs1Of(code); const hit = lookupCode(code);
+      $('#scanTestOut').textContent = [`Kód: ${code}`,
+        g ? `GS1: ${g.gtin ? 'GTIN ' + g.gtin : ''}${g.sscc ? ' SSCC ' + g.sscc : ''}${g.useBy ? ' · trvanlivost ' + fmtDay(g.useBy) : ''}${g.prodDate ? ' · výroba ' + fmtDay(g.prodDate) : ''}${g.lot ? ' · šarže ' + g.lot : ''}${g.netKg ? ' · ' + fmtQty(g.netKg) + ' kg' : ''}${g.count ? ' · počet ' + g.count : ''}` : 'GS1: ne (obyčejný kód)',
+        hit ? `Produkt: ${hit.p.name}${hit.pack ? ' · ' + packLabel(hit.p, hit.pack) : ''}${gs1Qty(hit) ? ' · množství ' + fmtQty(gs1Qty(hit)) + ' ' + hit.p.unit : ''}` : 'Produkt: nenalezen'].join('\n');
+    };
+    $('#scanTestBtn').onclick = () => { const v = $('#scanTest').value; if (v.trim()) showScanTest(v); };
+    $('#scanTest').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#scanTestBtn').click(); } };
     $('#updCheck').onclick = async () => { toast('Stahuji nejnovější verzi…'); try { if (swReg) await swReg.update(); } catch (_) {} setTimeout(() => location.reload(), 600); };
     $('#invSave').onclick = async () => {
       const inv = JSON.parse(JSON.stringify(state.settings.invoice || {}));
@@ -1609,13 +1878,14 @@
   };
 
   // ---------- Rychlý sken z horní lišty ----------
-  $('#quickScanBtn').onclick = () => scanner.open('Rychlé hledání', async (code) => {
+  async function quickScanHandle(code) {
     const ord = state.orders.find(x => x.no === code.toUpperCase());
     if (ord) { scanner.feedback(`Objednávka ${ord.no}`, true); await scanner.close(); location.hash = `#/objednavka?id=${ord.id}`; return; }
-    const p = productByCode(code);
+    const hit = lookupCode(code); const p = hit && hit.p;
     if (p) { scanner.feedback(p.name, true); await scanner.close(); location.hash = `#/produkt?id=${p.id}`; }
     else { scanner.feedback(`Neznámý kód ${code}`, false); await scanner.close(); const hit = await resolveUnknownCode(code); if (hit) { location.hash = `#/produkt?id=${hit.p.id}`; render(); } }
-  });
+  }
+  $('#quickScanBtn').onclick = () => scanner.open('Rychlé hledání', quickScanHandle);
 
   // ---------- Přihlášení (jen se společnou databází) ----------
   async function loginScreen() {

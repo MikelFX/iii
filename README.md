@@ -25,6 +25,8 @@ Pro mobil: nahrát složku na libovolný HTTPS hosting (GitHub Pages, Netlify, C
 - **Produkty** – kód (EAN/čárový kód), název, jednotka, kategorie, minimální zásoba, umístění, dodavatel, cena v Kč a v €, DPH; hledání, filtr, import/export CSV (stavy CZ/SK).
 - **Příjem / Výdej** – skenování kamerou, po načtení kódu zadání množství (např. 150 ks), rozpracovaný doklad přežije zavření appky, kontrola nedostatku zásob, číslované doklady.
 - **Kartony / balení** – produkt může mít další čárové kódy s počtem kusů (karton 12 ks, karton 6 ks…). Sken kartonu při příjmu, výdeji, inventuře i vychystávání přičte celé balení (zadá se počet kartonů). Neznámý kód jde při skenu rovnou uložit jako karton existujícího produktu.
+- **Etikety GS1-128 (kartony, palety)** – kamera i externí čtečka přečtou dlouhé kódy typu `(01)…(15)…(10)…`. Zboží se najde podle GTIN (kód kartonu / EAN), trvanlivost (15/17), datum výroby (11), šarže (10), čistá váha (310x) a počet balení na paletě (37) se doplní samy. Při příjmu se karton nebo celá paleta přidá bez psaní, u váženého zboží se váha z etikety předvyplní při vychystávání.
+- **Externí čtečka** – USB/Bluetooth čtečka v režimu klávesnice funguje kdekoli v aplikaci (včetně oddělovače GS / FNC1 a čísel z české klávesnice). Test v Nastavení → Čtečka čárových kódů.
 - **Inventura** – zvlášť pro sklad CZ a SK: skenování v regálech (+1 za sken nebo zadání množství), porovnání s evidencí, uzavření srovná stavy jen ve vybraném skladu.
 - **Historie** – všechny doklady s položkami (stav před / změna / po), export CSV.
 - **Přehled** – počty, produkty pod minimem, vyprodané, hodnota zásob, poslední pohyby.
@@ -36,4 +38,6 @@ Pro mobil: nahrát složku na libovolný HTTPS hosting (GitHub Pages, Netlify, C
 - `app.js` – logika obrazovek, skener, doklady
 - `db.js` – vrstva nad IndexedDB
 - `sw.js`, `manifest.json` – offline PWA
-- `vendor/html5-qrcode.min.js` – dekodér čárových kódů (kamera)
+- `gs1.js` – rozbor etiket GS1 (aplikační identifikátory)
+- `vendor/zxing-reader.js`, `vendor/zxing_reader.wasm` – dekodér čárových kódů ZXing-C++ (zxing-wasm 2.2.4, licence MIT/Apache-2.0)
+- `vendor/html5-qrcode.min.js` – záložní dekodér pro staré prohlížeče
