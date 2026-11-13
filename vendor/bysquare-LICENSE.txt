@@ -1,0 +1,5 @@
+vendor/bysquare.min.js is a browser bundle (esbuild, IIFE, global `BySquare`) of:
+- bysquare 4.1.1 (PAY by square encoder), Copyright Filip Seman, Apache-2.0 – https://github.com/xseman/bysquare
+- lzma1 0.8.0, MIT OR Apache-2.0 – https://github.com/xseman/lzma1
+The `validator` dependency is replaced by a stub (the app validates IBAN itself).
+vendor/qrcode-generator.js: qrcode-generator 2.0.4, Copyright (c) 2009 Kazuhiko Arase, MIT.
