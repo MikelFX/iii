@@ -15,7 +15,7 @@
   const ORDER_STATUS = { new: 'Nová', preparing: 'Připravuje se', ready: 'Připraveno', done: 'Vydáno', cancelled: 'Zrušeno' };
   const TYPE_BADGE = { receipt: 'ok', issue: 'warn', inventory: 'neutral', adjust: 'neutral', transfer: 'neutral' };
   const UNITS = ['ks', 'kg', 'g', 'l', 'ml', 'bal', 'krt', 'pal', 'm'];
-  const APP_VERSION = '0.6.0';
+  const APP_VERSION = '0.7.0';
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -242,6 +242,7 @@
     i.weights && i.weights.length > 1 ? 'váhy ' + i.weights.map(fmtQty).join(' + ') : '',
     i.useBy ? 'spotřeba do ' + fmtDay(i.useBy) : '',
     i.lotNo ? 'šarže ' + i.lotNo : '',
+    i.ssccs && i.ssccs.length ? 'paleta SSCC ' + i.ssccs.join(', ') : '',
     i.lot ? 'vybraná trvanlivost ' + lotLabel(i.lot.useBy) : '',
     i.batches && i.batches.some(b => b.useBy) ? 'šarže ' + [...new Set(i.batches.filter(b => b.useBy).map(b => fmtDay(b.useBy)))].join(', ') : '',
     i.manual ? 'bez skenu' : '',
@@ -272,6 +273,7 @@
     else if (diff > 0) { const b = { qty: diff, prodDate: it.prodDate || null, useBy: it.useBy || null, lotNo: it.lotNo || null, wh }; addBatch(p, b); line.prodDate = b.prodDate; line.useBy = b.useBy; if (b.lotNo) line.lotNo = b.lotNo; }
     else if (diff < 0) { line.batches = takeFromBatches(p, -diff, wh, it.lot || null); if (it.lot) line.lot = it.lot; }
     if (it.weights) line.weights = it.weights;
+    if (it.ssccs && it.ssccs.length) line.ssccs = it.ssccs;
     if (it.prodDate) p.lastProdDate = it.prodDate;
     if (it.useBy) p.lastUseBy = it.useBy;
     setStockOf(p, wh, after); p.updatedAt = Date.now();
@@ -309,6 +311,16 @@
   const gs1Of = (code) => (window.GS1 ? GS1.parse(code) : null);
   /** Krátký popis toho, co etiketa říká (pro hlášky). */
   const gs1Info = (g) => g ? [g.useBy ? 'do ' + fmtDay(g.useBy) : '', g.lot ? 'šarže ' + g.lot : '', g.netKg ? fmtQty(g.netKg) + ' kg' : '', g.count && g.contentGtin ? g.count + ' bal.' : ''].filter(Boolean).join(' · ') : '';
+
+  /** Paletová etiketa jen s SSCC (00): kde už byla přijata (příjemky si SSCC pamatují). */
+  const ssccReceipts = (sscc) => state.movements.filter(m => m.type === 'receipt' && m.items.some(i => (i.ssccs || []).includes(sscc)));
+  function ssccMessage(g, code) {
+    if (!g || !g.sscc) return `Etiketa bez kódu zboží: ${code}`;
+    const m = ssccReceipts(g.sscc)[0];
+    const it = m && m.items.find(i => (i.ssccs || []).includes(g.sscc));
+    return it ? `Paleta SSCC ${g.sscc}: ${it.name} (přijato ${m.docNo}). Číslo palety není kód zboží – naskenuj EAN na kartonu/kusu.`
+      : `Číslo palety SSCC ${g.sscc} – neříká, co je uvnitř. Naskenuj EAN na kartonu/kusu, nebo vyber produkt ze seznamu.`;
+  }
 
   /** Dekodér ZXing-C++ (WebAssembly) – čte i dlouhé GS1-128 kódy z kartonů a palet. Načte se při prvním skenu. */
   const zx = {
@@ -382,7 +394,7 @@
       if (caps.torch) { let on = false; torch.classList.remove('hidden'); torch.onclick = async () => { on = !on; try { await this.track.applyConstraints({ advanced: [{ torch: on }] }); torch.classList.toggle('on', on); } catch (_) {} }; }
       const zoom = $('#camZoom');
       if (caps.zoom && caps.zoom.max > caps.zoom.min) {
-        const steps = [Math.max(1, caps.zoom.min), 2, 3].filter((z, i, a) => z <= caps.zoom.max && a.indexOf(z) === i);
+        const steps = [Math.max(1, caps.zoom.min), 1.5, 2, 3].filter((z, i, a) => z <= caps.zoom.max && a.indexOf(z) === i);
         if (steps.length > 1) { zoom.classList.remove('hidden'); this.zoomIdx = 0; zoom.onclick = async () => { this.zoomIdx = (this.zoomIdx + 1) % steps.length; try { await this.track.applyConstraints({ advanced: [{ zoom: steps[this.zoomIdx] }] }); zoom.textContent = steps[this.zoomIdx] + '×'; } catch (_) {} }; }
       }
     },
@@ -403,9 +415,11 @@
             }
             // ZXing: bez nativní čtečky pokaždé, s ní jen když dlouho nic nenašla (každý 3. snímek).
             if (!texts.length && zxOk && (!this.native || (nativeMisses > 4 && nativeMisses % 3 === 0))) {
-              // Střed obrazu (rámeček): celá šířka, 60 % výšky; max. 1600 px pro rychlost.
-              const vw = v.videoWidth, vh = v.videoHeight;
-              const ch = Math.round(vh * (vw > vh ? 0.8 : 0.6)), cy = Math.round((vh - ch) / 2);
+              // Střed obrazu (rámeček): celá šířka, 60 % výšky; každý 2. pokus celý snímek (široké paletové kódy,
+              // které se do rámečku nevejdou nebo jsou mimo střed). Max. 1600 px pro rychlost.
+              const vw = v.videoWidth, vh = v.videoHeight; this.zxPass = (this.zxPass || 0) + 1;
+              const full = this.zxPass % 2 === 0;
+              const ch = full ? vh : Math.round(vh * (vw > vh ? 0.8 : 0.6)), cy = Math.round((vh - ch) / 2);
               const scale = Math.min(1, 1600 / Math.max(vw, ch));
               canvas.width = Math.round(vw * scale); canvas.height = Math.round(ch * scale);
               ctx.drawImage(v, 0, cy, vw, ch, 0, 0, canvas.width, canvas.height);
@@ -450,9 +464,10 @@
       this.lastCode = code; this.lastSeen = now;
       const g = gs1Of(code);
       if (g && !g.gtin) {
-        // Samotné SSCC (00) – číslo palety, neříká co je uvnitř.
-        const msg = g.sscc ? `Kód palety SSCC ${g.sscc} – naskenuj druhý kód se zbožím (02)/(01)` : `Etiketa bez kódu zboží: ${code}`;
-        if (!$('#scanModal').classList.contains('hidden')) this.feedback(msg, false); else toast(msg, 3500);
+        // Samotné SSCC (00) – číslo palety, neříká co je uvnitř. Příjem ho umí (vybere se produkt ručně), jinde jen hláška.
+        if (g.sscc && this.onCode && this.onCode.sscc) return this.onCode(code);
+        const msg = ssccMessage(g, code);
+        if (!$('#scanModal').classList.contains('hidden')) this.feedback(msg, false); else { beep(false); toast(msg, 5000); }
         return;
       }
       if (this.onCode) this.onCode(code);
@@ -491,7 +506,11 @@
     if (!$('#scanModal').classList.contains('hidden')) return scanner.handle(code);
     if (!$('#errScreen').classList.contains('hidden')) { beep(false); return; }
     const g = gs1Of(code);
-    if (g && !g.gtin) return scanner.handle(code); // jen hláška o SSCC
+    if (g && !g.gtin) { // paleta SSCC: příjem ji zpracuje, jinde jen hláška
+      const dlg = $$('.modal').some(m => m.id !== 'scanModal' && !m.classList.contains('hidden'));
+      if (g.sscc && pageScan && pageScan.sscc && !dlg) return pageScan(code);
+      return scanner.handle(code);
+    }
     const dlgOpen = $$('.modal').some(m => m.id !== 'scanModal' && !m.classList.contains('hidden'));
     if (dlgOpen) { if (dialogScan) dialogScan(code); else { beep(false); toast('Nejdřív dokonči otevřené okno, pak skenuj.'); } return; }
     (pageScan || quickScanHandle)(code);
@@ -934,14 +953,58 @@
       const save = () => drafts.set(key, draft);
 
       /** Přidá řádek do dokladu; stejný produkt se stejnou trvanlivostí a šarží se přičte. */
-      const addRow = async (p, q, pd, ub, ln) => {
+      const addRow = async (p, q, pd, ub, ln, sscc = null) => {
         let row = draft.items.find(i => i.productId === p.id && (i.prodDate || null) === pd && (i.useBy || null) === ub && (i.lotNo || null) === ln);
         if (row) row.qty = round3(Number(row.qty) + q); else { row = { productId: p.id, qty: q, prodDate: pd, useBy: ub, lotNo: ln }; draft.items.unshift(row); }
+        if (sscc) row.ssccs = [...(row.ssccs || []), sscc];
         await save(); draw();
         return row;
       };
+      /** Paletová etiketa jen s číslem palety SSCC (např. Entremont): zboží v kódu není → produkt vybrat, množství a šarži opsat.
+       *  SSCC se uloží k řádku příjmu, takže druhý štítek téže palety se nezapočítá dvakrát. */
+      const addSscc = async (sscc) => {
+        const say = (msg, ok) => { if (!$('#scanModal').classList.contains('hidden')) scanner.feedback(msg, ok); else { beep(ok); toast(msg, 4500); } };
+        const dup = draft.items.find(i => (i.ssccs || []).includes(sscc));
+        if (dup) { const dp = productById(dup.productId); say(`Tahle paleta už v příjmu je${dp ? ' (' + dp.name + ')' : ''} – druhý štítek téže palety se nepočítá.`, false); return; }
+        if (!$('#scanModal').classList.contains('hidden')) { say(`📦 Paleta SSCC ${sscc} – vyber zboží`, true); await scanner.pause(); }
+        const prev = ssccReceipts(sscc)[0];
+        const prevIt = prev && prev.items.find(i => (i.ssccs || []).includes(sscc));
+        // Nabídka: zboží, které už přišlo na paletách od stejného dodavatele (stejný začátek SSCC).
+        const pref = sscc.slice(1, 8); const recent = [];
+        for (const m of state.movements) {
+          if (m.type !== 'receipt') continue;
+          for (const i of m.items) if ((i.ssccs || []).some(x => x.slice(1, 8) === pref) && !recent.includes(i.productId) && productById(i.productId)) recent.push(i.productId);
+          if (recent.length >= 4) break;
+        }
+        const choice = await dialog(`
+          <div class="modal-head"><strong>📦 Paletová etiketa</strong><button class="iconbtn" data-close>✕</button></div>
+          <p style="margin-top:0">Načteno <span class="mono">(00) ${esc(sscc)}</span> – to je <strong>číslo palety (SSCC)</strong>, ne kód zboží. Vyber produkt podle textu na etiketě a v dalším kroku opiš množství (Qte) a šarži (Lot).</p>
+          ${prevIt ? `<div class="pack-note" style="border-color:#e0a800">⚠️ Tahle paleta už byla přijata: ${esc(prev.docNo)} · ${fmtDate(prev.ts)} · ${esc(prevIt.name)} ${fmtQty(prevIt.qty)} ${esc(prevIt.unit || '')}. Přijmi ji znovu jen pokud jde opravdu o nové zboží.</div>` : ''}
+          <div class="list">
+            ${recent.map(id => { const p = productById(id); return `<button type="button" class="btn secondary big" data-rp="${esc(id)}">↺ ${esc(p.name)}</button>`; }).join('')}
+            <button type="button" class="btn big" id="ssPick">📋 Vybrat produkt</button>
+            <button type="button" class="btn secondary" data-close>Zrušit</button>
+          </div>`, { onOpen(card, close) { $('#ssPick', card).onclick = () => close('pick'); $$('[data-rp]', card).forEach(b => b.onclick = () => close('id:' + b.dataset.rp)); } });
+        let p = null;
+        if (choice === 'pick') p = await pickProduct();
+        else if (typeof choice === 'string' && choice.startsWith('id:')) p = productById(choice.slice(3));
+        if (p) {
+          const pack = (p.packs || []).find(k => Number(k.qty) > 1) || null;
+          const last = draft.items.find(i => i.productId === p.id);
+          const r = await qtyDialog(p, { title: `Příjem palety: ${p.name}`, defaultQty: '', pack, packsDefault: '', dates: true,
+            prodDate: last ? last.prodDate || '' : '', useBy: last ? last.useBy || '' : '', lotNo: last ? last.lotNo || '' : '',
+            extraHtml: `<p class="pack-note">🏷️ Paleta <span class="mono">${esc(sscc)}</span> – opiš z etikety počet (např. „Qte 22U“)${pack ? ' – stačí počet kartonů' : ''}, šarži (Lot) a trvanlivost.</p>` });
+          if (r && r.qty > 0) {
+            const row = await addRow(p, r.qty, r.prodDate || null, r.useBy || null, r.lotNo || null, sscc);
+            say(`✓ ${p.name}: +${fmtQty(r.qty)} ${p.unit} (paleta) · celkem ${fmtQty(row.qty)} ${p.unit}`, true);
+          }
+        }
+        if (scanner.running) await scanner.resume();
+      };
       const addCode = async (code) => {
         const scanning = !$('#scanModal').classList.contains('hidden');
+        const g0 = gs1Of(code);
+        if (g0 && !g0.gtin && g0.sscc) { if (type === 'receipt') return addSscc(g0.sscc); return scanner.handle(code); }
         let hit = lookupCode(code);
         if (!hit) {
           if (scanning) { scanner.feedback(`Neznámý kód ${code}`, false); await scanner.close(); }
@@ -987,7 +1050,7 @@
           const p = productById(it.productId); if (!p) return '';
           const have = stockOf(p, whFrom()); const warn = type !== 'receipt' && have < it.qty;
           return `<div class="item">
-            <div class="grow"><div class="name">${esc(p.name)}</div><div class="code mono">${esc(p.code)} · skladem ${fmtQty(have)} ${esc(p.unit)} (${esc(whFrom())})${warn ? ' <span class="badge danger">nedostatek</span>' : ''}${it.useBy ? ' · spotřeba do ' + fmtDay(it.useBy) : ''}${it.prodDate ? ' · výroba ' + fmtDay(it.prodDate) : ''}${it.lotNo ? ' · šarže ' + esc(it.lotNo) : ''}</div></div>
+            <div class="grow"><div class="name">${esc(p.name)}</div><div class="code mono">${esc(p.code)} · skladem ${fmtQty(have)} ${esc(p.unit)} (${esc(whFrom())})${warn ? ' <span class="badge danger">nedostatek</span>' : ''}${it.useBy ? ' · spotřeba do ' + fmtDay(it.useBy) : ''}${it.prodDate ? ' · výroba ' + fmtDay(it.prodDate) : ''}${it.lotNo ? ' · šarže ' + esc(it.lotNo) : ''}${it.ssccs && it.ssccs.length ? ` · 📦 ${it.ssccs.length === 1 ? 'paleta' : it.ssccs.length + ' palety'}` : ''}</div></div>
             <div class="qty-ctl"><button data-dec="${idx}">−</button><input type="number" step="any" min="0" data-qty="${idx}" value="${it.qty}"><button data-inc="${idx}">+</button></div>
             <button class="iconbtn" data-del="${idx}" title="Odebrat">🗑</button>
           </div>`;
@@ -1025,6 +1088,7 @@
       $('#docNote').oninput = async (e) => { draft.note = e.target.value; await save(); };
       const whLink = $('#docWh'); if (whLink) whLink.onclick = (e) => { e.preventDefault(); $('#whBtn').click(); };
       const swap = $('#docSwap'); if (swap) swap.onclick = async () => { draft.from = whTo(); await save(); drawDir(); draw(); toast(`Přesun ${whFrom()} → ${whTo()}`); };
+      addCode.sscc = type === 'receipt'; // příjem umí i paletovou etiketu jen s SSCC
       $('#docScan').onclick = () => scanner.open(labels.scan, addCode);
       pageScan = addCode;
       $('#docPick').onclick = async () => { const p = await pickProduct(); if (p) { await addCode(p.code); } };
@@ -1786,7 +1850,7 @@
       const code = cleanScan(raw); const g = gs1Of(code); const hit = lookupCode(code);
       $('#scanTestOut').textContent = [`Kód: ${code}`,
         g ? `GS1: ${g.gtin ? 'GTIN ' + g.gtin : ''}${g.sscc ? ' SSCC ' + g.sscc : ''}${g.useBy ? ' · trvanlivost ' + fmtDay(g.useBy) : ''}${g.prodDate ? ' · výroba ' + fmtDay(g.prodDate) : ''}${g.lot ? ' · šarže ' + g.lot : ''}${g.netKg ? ' · ' + fmtQty(g.netKg) + ' kg' : ''}${g.count ? ' · počet ' + g.count : ''}` : 'GS1: ne (obyčejný kód)',
-        hit ? `Produkt: ${hit.p.name}${hit.pack ? ' · ' + packLabel(hit.p, hit.pack) : ''}${gs1Qty(hit) ? ' · množství ' + fmtQty(gs1Qty(hit)) + ' ' + hit.p.unit : ''}` : 'Produkt: nenalezen'].join('\n');
+        g && g.sscc && !g.gtin ? ssccMessage(g, code) : hit ? `Produkt: ${hit.p.name}${hit.pack ? ' · ' + packLabel(hit.p, hit.pack) : ''}${gs1Qty(hit) ? ' · množství ' + fmtQty(gs1Qty(hit)) + ' ' + hit.p.unit : ''}` : 'Produkt: nenalezen'].join('\n');
     };
     $('#scanTestBtn').onclick = () => { const v = $('#scanTest').value; if (v.trim()) showScanTest(v); };
     $('#scanTest').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#scanTestBtn').click(); } };
