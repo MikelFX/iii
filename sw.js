@@ -1,6 +1,5 @@
 /* Service worker: aplikace funguje offline (po prvním načtení). */
-const CACHE = 'imco-sklad-v14';
-const ASSETS = ['./', './index.html', './styles.css', './app.js', './db.js', './manifest.json', './icon.svg', './vendor/html5-qrcode.min.js', './vendor/zxing-reader.js', './vendor/zxing_reader.wasm', './gs1.js', './vendor/supabase.js', './vendor/jsbarcode.all.min.js', './vendor/qrcode-generator.js', './vendor/bysquare.min.js', './payqr.js'];
+const CACHE = 'imco-sklad-v15';
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));

@@ -24,7 +24,7 @@
   const reasonInfo = (id) => DAMAGE_REASONS.find(r => r.id === id) || { id, icon: '⚠️', label: id || 'neuvedeno' };
   const reasonBadge = (id) => `<span class="badge reason-${esc(id)}">${reasonInfo(id).icon} ${esc(reasonInfo(id).label)}</span>`;
   const UNITS = ['ks', 'kg', 'g', 'l', 'ml', 'bal', 'krt', 'pal', 'm'];
-  const APP_VERSION = '0.11.0';
+  const APP_VERSION = '0.11.1';
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -1477,7 +1477,7 @@
     for (const rawLine of text.split(/\n|;/)) {
       const line = rawLine.trim(); if (!line) continue;
       let qty = 1, name = line, unit = '';
-      const m = line.match(/^(\d+(?:[.,]\d+)?)\s*(ks|kg|g|l|ml|bal|krt|pal|m|x)?\s*[x×]?\s*(.+)$/i) || line.match(/^(.+?)\s*[-–:]?\s*(\d+(?:[.,]\d+)?)\s*(ks|kg|g|l|ml|bal|krt|pal|m)?\.?$/i);
+      const m = line.match(/^(\d+(?:[.,]\d+)?)\s*(?:(ks|kg|g|l|ml|bal|krt|pal|m)\.?(?![\p{L}\d]))?\s*(?:[x×](?![\p{L}]))?\s*(.+)$/iu) || line.match(/^(.+?)\s*[-–:]?\s*(\d+(?:[.,]\d+)?)\s*(ks|kg|g|l|ml|bal|krt|pal|m)?\.?$/i);
       if (m) {
         if (/^\d/.test(m[1])) { qty = Number(m[1].replace(',', '.')); unit = (m[2] || '').toLowerCase(); name = m[3]; }
         else { name = m[1]; qty = Number(m[2].replace(',', '.')); unit = (m[3] || '').toLowerCase(); }
