@@ -328,3 +328,13 @@ tr.clickable:hover { background: var(--bg); }
 .inv-qr-code svg { width: 100%; height: 100%; display: block; }
 .inv-qr-lbl { font-size: 12px; font-weight: 700; margin-top: 4px; letter-spacing: .03em; }
 @media print { .inv-qr-code { width: 34mm; height: 34mm; } }
+
+/* Dodací list (tisk z počítače, A4) */
+.dl .inv-head { align-items: flex-start; }
+.dl-code { width: 200px; margin-top: 6px; }
+.dl-code svg { width: 100%; height: auto; display: block; }
+.dl-sign { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; margin-top: 26px; break-inside: avoid; page-break-inside: avoid; }
+.dl-name { min-height: 20px; font-weight: 600; }
+.dl-line { border-top: 1px solid #000; margin-top: 44px; padding-top: 4px; font-size: 12px; color: #444; }
+@media (max-width: 560px) { .dl-sign { grid-template-columns: 1fr; } .dl-code { width: 100%; } }
+@media print { .dl-code { width: 52mm; } .dl .inv-head { flex-wrap: nowrap; } }

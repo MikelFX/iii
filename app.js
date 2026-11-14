@@ -15,7 +15,7 @@
   const ORDER_STATUS = { new: 'Nová', preparing: 'Připravuje se', ready: 'Připraveno', done: 'Vydáno', cancelled: 'Zrušeno' };
   const TYPE_BADGE = { receipt: 'ok', issue: 'warn', inventory: 'neutral', adjust: 'neutral', transfer: 'neutral' };
   const UNITS = ['ks', 'kg', 'g', 'l', 'ml', 'bal', 'krt', 'pal', 'm'];
-  const APP_VERSION = '0.8.0';
+  const APP_VERSION = '0.9.0';
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -770,7 +770,7 @@
     const { path, params } = currentRoute();
     const fn = routes[path] || routes['/'];
     if (path !== lastPath) { lastPath = path; window.scrollTo(0, 0); } // nová obrazovka začíná nahoře
-    document.body.classList.toggle('print-label', path === '/stitek' || path === '/faktura');
+    document.body.classList.toggle('print-label', path === '/stitek' || path === '/faktura' || path === '/dodaci-list');
     $$('[data-route]').forEach(a => a.classList.toggle('active', a.dataset.route === path));
     $('#sidenav').classList.remove('open'); $('#backdrop').classList.remove('open');
     pageScan = null;
@@ -1557,10 +1557,10 @@
           <div><h2>${esc(o.no)} ${whBadge(o.wh)}</h2><div class="muted">${esc(o.customer || 'bez odběratele')}${o.custIco ? ' · IČO ' + esc(o.custIco) : ''} · ${fmtDate(o.ts)}${o.createdBy ? ' · zadal ' + esc(o.createdBy) : ''}</div>${o.note ? `<div style="margin-top:6px">📝 ${esc(o.note)}</div>` : ''}</div>
           <span class="badge status-${o.status}" style="font-size:14px">${ORDER_STATUS[o.status]}</span>
         </div>
-        ${o.status === 'ready' || o.status === 'done' ? `<div class="muted small" style="margin-top:8px">Připravil ${esc(o.preparedBy || '—')} ${o.preparedAt ? fmtDate(o.preparedAt) : ''}${o.movementId ? ' · výdejka <a href="#" id="ordMv">zobrazit</a>' : ''}${o.invoiceNo ? ' · faktura ' + esc(o.invoiceNo) : ''}</div>` : ''}
+        ${o.status === 'ready' || o.status === 'done' ? `<div class="muted small" style="margin-top:8px">Připravil ${esc(o.preparedBy || '—')} ${o.preparedAt ? fmtDate(o.preparedAt) : ''}${o.movementId ? ' · výdejka <a href="#" id="ordMv">zobrazit</a>' : ''}${o.deliveryNo ? ' · dodací list ' + esc(o.deliveryNo) : ''}${o.invoiceNo ? ' · faktura ' + esc(o.invoiceNo) : ''}</div>` : ''}
       </div>
       ${editable && o.wh !== state.wh ? `<div class="card" style="border-color:var(--primary)">ℹ️ Objednávka je ze skladu <strong>${whInfo(o.wh).flag} ${esc(whName(o.wh))}</strong>. Vydané zboží se odepíše z tohoto skladu, i když máš v zařízení vybraný ${esc(whName(state.wh))}.</div>` : ''}
-      ${o.status === 'ready' || o.status === 'done' ? `<div class="card label-card"><div class="row between"><h2>🏷️ Štítek a faktura</h2><div class="row"><a class="btn" href="#/stitek?id=${o.id}">🖨 Štítek na paletu</a><a class="btn secondary" href="#/faktura?id=${o.id}">🧾 Faktura</a></div></div><svg id="ordBarcode"></svg><p class="muted small" style="margin:6px 0 0">Naskenováním štítku (📷 nahoře) se objednávka otevře v mobilu. Fakturu vytiskneš z počítače.</p></div>` : ''}
+      ${o.status === 'ready' || o.status === 'done' ? `<div class="card label-card"><div class="row between"><h2>🏷️ Štítek, dodací list a faktura</h2><div class="row"><a class="btn" href="#/stitek?id=${o.id}">🖨 Štítek na paletu</a><a class="btn secondary" href="#/dodaci-list?id=${o.id}">📄 Dodací list</a><a class="btn secondary" href="#/faktura?id=${o.id}">🧾 Faktura</a></div></div><svg id="ordBarcode"></svg><p class="muted small" style="margin:6px 0 0">Naskenováním štítku (📷 nahoře) se objednávka otevře v mobilu. Dodací list a fakturu vytiskneš z počítače.</p></div>` : ''}
       ${editable ? `<p class="muted small" style="margin:0 0 10px">Ťukni na položku, naskenuj její čárový kód a potvrď množství. Vydané zboží se hned odepíše ze skladu.</p>` : ''}
       ${unmatched.length && editable ? `<div class="card" style="border-color:var(--danger)"><strong>⚠️ ${unmatched.length} položek není přiřazeno k produktu</strong><div class="muted small">Přiřaď je přes Upravit → 🔗, jinak je nejde vydat.</div></div>` : ''}
       ${short.length && editable ? `<div class="card" style="border-color:var(--warn)"><strong>⚠️ Nedostatek na skladě:</strong> ${short.map(i => esc(i.name)).join(', ')}</div>` : ''}
@@ -1599,13 +1599,13 @@
       if (!picked.length) { toast('Nejdřív naskenuj a vydej položky'); return; }
       if (notPicked.length && !await confirmDlg('Ukončit objednávku', `${notPicked.length} položek není vychystaných (${notPicked.map(i => i.name).join(', ')}). Nebudou odepsány ze skladu. Ukončit i tak?`, 'Ukončit')) return;
       o.status = 'ready'; o.preparedBy = state.user; o.preparedAt = Date.now();
-      await assignInvoiceNo(o);
-      await saveOrder(o); toast(`${o.no} připraveno – štítek i faktura jsou k tisku`); render();
+      await assignDeliveryNo(o); await assignInvoiceNo(o);
+      await saveOrder(o); toast(`${o.no} připraveno – štítek, dodací list i faktura jsou k tisku`); render();
     };
     const dn = $('#ordDone', el); if (dn) dn.onclick = async () => { o.status = 'done'; o.doneAt = Date.now(); await saveOrder(o); render(); };
     const cp = $('#ordCopy', el); if (cp) cp.onclick = async () => {
       const items = o.items.map(i => { const c = { ...i, id: uid(), picked: null, pickedAt: null, pickedBy: null, weights: null, manual: false, pickedLots: null }; delete c.lot; return c; });
-      const n = await orderForm({ ...o, id: uid(), no: '', ts: Date.now(), status: 'new', items, preparedBy: null, preparedAt: null, movementId: null, doneAt: null, invoiceNo: null, invoiceAt: null, createdBy: state.user });
+      const n = await orderForm({ ...o, id: uid(), no: '', ts: Date.now(), status: 'new', items, preparedBy: null, preparedAt: null, movementId: null, doneAt: null, deliveryNo: null, deliveryAt: null, invoiceNo: null, invoiceAt: null, createdBy: state.user });
       if (n) location.hash = `#/objednavka?id=${n.id}`;
     };
   };
@@ -1720,6 +1720,84 @@
       <p class="muted small no-print">Ceny bez DPH jsou z karty produktu (${cur === 'EUR' ? 'cena v €' : 'cena v Kč'}), sazba DPH z produktu nebo výchozí z Nastavení → Fakturace.</p>`;
     $('#invPrint', el).onclick = () => window.print();
     $('#invBilling', el).onclick = async () => { if (await billingDialog(o)) render(); };
+  };
+
+  // ---------- Dodací list ke každé připravené objednávce ----------
+  /** Číslo dodacího listu se přidělí při „Ukončeno – připraveno“; každý sklad má vlastní řadu (DL-CZ-…, DL-SK-…). */
+  async function assignDeliveryNo(o) {
+    if (o.deliveryNo) return;
+    const key = `deliverySeq_${o.wh}`; const seq = (state.settings[key] || 0) + 1; await setSetting(key, seq);
+    o.deliveryNo = `DL-${o.wh}-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`; o.deliveryAt = Date.now();
+  }
+  /** Řádky dodacího listu: vydané množství, váhy kusů a skutečně vydané šarže (z výdejky objednávky). */
+  function deliveryLines(o) {
+    const m = o.movementId ? state.movements.find(x => x.id === o.movementId) : null;
+    const picked = o.items.filter(i => i.picked != null && i.picked > 0);
+    return (picked.length ? picked : o.items).map(i => {
+      const p = i.productId ? productById(i.productId) : null;
+      const line = m && m.items.find(l => l.orderItemId === i.id);
+      const lots = {};
+      (line && line.batches || []).forEach(b => { const k = (b.useBy || '') + '|' + (b.lotNo || ''); lots[k] = lots[k] || { useBy: b.useBy || null, lotNo: b.lotNo || null, qty: 0 }; lots[k].qty = round3(lots[k].qty + b.qty); });
+      let lotList = Object.values(lots).filter(l => l.useBy || l.lotNo);
+      if (!lotList.length && i.pickedLots && i.pickedLots.some(Boolean)) lotList = i.pickedLots.filter(Boolean).map(u => ({ useBy: u, lotNo: null, qty: null }));
+      const multi = lotList.length > 1;
+      return { name: i.name, code: i.code || (p && p.code) || '', unit: i.unit, qty: i.picked ?? i.qty, kg: lineKg(i.unit, i.picked ?? i.qty, p), ordered: i.qty, picked: i.picked != null, weights: i.weights,
+        lots: lotList.map(l => ({ ...l, qty: multi ? l.qty : null })) };
+    });
+  }
+  /** Hmotnost řádku v kg: kg/g přímo, jinak množství × „Hmotnost 1 ks“ z karty produktu (když je vyplněná). */
+  function lineKg(unit, qty, p) {
+    const q = Number(qty || 0);
+    if (unit === 'kg') return q; if (unit === 'g') return q / 1000;
+    return p && Number(p.weight) > 0 ? q * Number(p.weight) : null;
+  }
+  routes['/dodaci-list'] = async (el, params) => {
+    const o = orderById(params.get('id'));
+    if (!o) { location.hash = '#/objednavky'; return; }
+    if (!o.deliveryNo && (o.status === 'ready' || o.status === 'done')) { await assignDeliveryNo(o); await saveOrder(o); }
+    setTitle(`Dodací list ${o.deliveryNo || o.no}`);
+    const cfg = invoiceCfg(o.wh); const wh = o.wh;
+    const lines = deliveryLines(o);
+    const issue = dayStr(o.deliveryAt || o.preparedAt || Date.now());
+    const kg = round3(lines.reduce((s, l) => s + (l.kg || 0), 0)); const kgAll = lines.every(l => l.kg != null);
+    const pcs = round3(lines.filter(l => !['kg', 'g'].includes(l.unit)).reduce((s, l) => s + Number(l.qty || 0), 0));
+    const notAll = o.items.filter(i => i.picked == null || (i.picked < i.qty));
+    const missingDl = o.items.some(i => i.picked != null) ? o.items.filter(i => i.picked == null || i.picked === 0) : [];
+    el.innerHTML = `
+      ${!cfg.name ? `<div class="card no-print" style="border-color:var(--warn)">⚠️ Chybí údaje dodavatele (název, adresa, IČO…). Doplň je v <a href="#/nastaveni">Nastavení → Fakturace</a> pro ${esc(whName(wh))}.</div>` : ''}
+      ${o.status !== 'ready' && o.status !== 'done' ? '<div class="card no-print" style="border-color:var(--warn)">⚠️ Objednávka ještě není připravená – toto je jen náhled, dodací list dostane číslo při „Ukončeno – připraveno“.</div>' : ''}
+      <div class="invoice dl">
+        <div class="inv-head">
+          <div><div class="inv-title">DODACÍ LIST</div><div class="inv-no">${esc(o.deliveryNo || 'náhled')}</div><div class="small">${whInfo(wh).flag} ${esc(whName(wh))} · objednávka ${esc(o.no)}</div><div class="dl-code"><svg id="dlBarcode"></svg></div></div>
+          <table class="inv-meta"><tr><td>Datum vystavení</td><td>${fmtDay(issue)}</td></tr><tr><td>Datum dodání</td><td>${fmtDay(issue)}</td></tr><tr><td>Objednávka</td><td>${esc(o.no)}</td></tr>${o.invoiceNo ? `<tr><td>Faktura</td><td>${esc(o.invoiceNo)}</td></tr>` : ''}${o.invoiceNote ? `<tr><td>Vaše objednávka</td><td>${esc(o.invoiceNote)}</td></tr>` : ''}</table>
+        </div>
+        <div class="inv-parties">
+          <div class="inv-party"><div class="inv-lbl">Dodavatel</div><strong>${esc(cfg.name || '—')}</strong><div>${esc(cfg.address || '').replace(/\n/g, '<br>')}</div>${cfg.ico ? `<div>IČO: ${esc(cfg.ico)}</div>` : ''}${cfg.dic ? `<div>DIČ / IČ DPH: ${esc(cfg.dic)}</div>` : ''}</div>
+          <div class="inv-party"><div class="inv-lbl">Odběratel / místo dodání</div><strong>${esc(o.customer || '—')}</strong><div>${esc(o.custAddress || '')}</div>${o.custIco ? `<div>IČO: ${esc(o.custIco)}</div>` : ''}${o.custDic ? `<div>DIČ / IČ DPH: ${esc(o.custDic)}</div>` : ''}</div>
+        </div>
+        <table class="inv-table">
+          <tr><th class="num">#</th><th>Položka</th><th>Šarže / trvanlivost</th><th class="num">Dodáno</th></tr>
+          ${lines.map((l, n) => `<tr><td class="num">${n + 1}</td><td>${esc(l.name)}<div class="small muted">${esc(l.code)}${l.weights && l.weights.length > 1 ? ' · váhy kusů: ' + l.weights.map(fmtQty).join(' + ') + ' ' + esc(l.unit) : ''}</div></td>
+            <td class="small">${l.lots.length ? l.lots.map(x => [x.lotNo ? 'LOT ' + esc(x.lotNo) : '', x.useBy ? 'spotřebujte do ' + fmtDay(x.useBy) : '', x.qty != null ? '(' + fmtQty(x.qty) + ' ' + esc(l.unit) + ')' : ''].filter(Boolean).join(' · ')).join('<br>') : '<span class="muted">—</span>'}</td>
+            <td class="num"><strong>${fmtQty(l.qty)} ${esc(l.unit)}</strong>${l.picked && l.qty !== l.ordered ? `<div class="small muted">obj. ${fmtQty(l.ordered)}</div>` : ''}</td></tr>`).join('')}
+        </table>
+        ${missingDl.length ? `<div class="small" style="margin-top:6px">Nedodáno: ${missingDl.map(i => `${esc(i.name)} (obj. ${fmtQty(i.qty)} ${esc(i.unit)})`).join(', ')}</div>` : ''}
+        <div class="inv-totals"><table>
+          <tr><td>Počet položek</td><td class="num">${lines.length}</td></tr>
+          ${pcs ? `<tr><td>Celkem kusů / balení</td><td class="num">${fmtQty(pcs)}</td></tr>` : ''}
+          ${kg ? `<tr><td>${kgAll ? 'Celková hmotnost' : 'Hmotnost (jen položky se známou váhou)'}</td><td class="num">${fmtQty(kg)} kg</td></tr>` : ''}
+        </table></div>
+        <div class="dl-sign">
+          <div><div class="inv-lbl">Předal (dodavatel)</div><div class="dl-name">${esc(o.preparedBy || '')}</div><div class="dl-line">Datum a podpis</div></div>
+          <div><div class="inv-lbl">Převzal (odběratel)</div><div class="dl-name">&nbsp;</div><div class="dl-line">Jméno, datum, podpis a razítko</div></div>
+        </div>
+        <div class="inv-foot">Zboží převzato v pořádku, v uvedeném množství a bez viditelného poškození.${o.preparedBy ? `<div class="small muted">Vychystal: ${esc(o.preparedBy)}${o.preparedAt ? ' · ' + fmtDate(o.preparedAt) : ''}</div>` : ''}</div>
+      </div>
+      <div class="row no-print" style="margin-top:14px"><button class="btn" id="dlPrint">🖨 Tisknout / uložit PDF</button><button class="btn secondary" id="dlBilling">✏️ Údaje odběratele</button><a class="btn secondary" href="#/objednavka?id=${o.id}">← Zpět na objednávku</a></div>
+      <p class="muted small no-print">Dodací list je bez cen. Vytiskni ho 2× – jeden podepsaný zůstává u vás, druhý dostane odběratel.${notAll.length && (o.status === 'ready' || o.status === 'done') ? ` Pozor: některé položky nebyly dodány v plném objednaném množství.` : ''}</p>`;
+    drawBarcode($('#dlBarcode', el), o.no);
+    $('#dlPrint', el).onclick = () => window.print();
+    $('#dlBilling', el).onclick = async () => { if (await billingDialog(o)) render(); };
   };
 
   // ---------- Historie ----------
