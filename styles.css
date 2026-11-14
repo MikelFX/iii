@@ -346,3 +346,12 @@ tr.clickable:hover { background: var(--bg); }
 .badge.reason-broken, .badge.reason-rotten { background: var(--danger-bg); color: var(--danger); }
 .badge.reason-expired { background: var(--warn-bg); color: var(--warn); }
 .badge.reason-other, .badge.reason-mixed { background: var(--bg); color: var(--muted); border: 1px solid var(--line); }
+/* Dodací list (tisk z počítače, A4) */
+.dl .inv-head { align-items: flex-start; }
+.dl-code { width: 200px; margin-top: 6px; }
+.dl-code svg { width: 100%; height: auto; display: block; }
+.dl-sign { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; margin-top: 26px; break-inside: avoid; page-break-inside: avoid; }
+.dl-name { min-height: 20px; font-weight: 600; }
+.dl-line { border-top: 1px solid #000; margin-top: 44px; padding-top: 4px; font-size: 12px; color: #444; }
+@media (max-width: 560px) { .dl-sign { grid-template-columns: 1fr; } .dl-code { width: 100%; } }
+@media print { .dl-code { width: 52mm; } .dl .inv-head { flex-wrap: nowrap; } }
