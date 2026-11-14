@@ -15,7 +15,7 @@
   const ORDER_STATUS = { new: 'Nová', preparing: 'Připravuje se', ready: 'Připraveno', done: 'Vydáno', cancelled: 'Zrušeno' };
   const TYPE_BADGE = { receipt: 'ok', issue: 'warn', inventory: 'neutral', adjust: 'neutral', transfer: 'neutral' };
   const UNITS = ['ks', 'kg', 'g', 'l', 'ml', 'bal', 'krt', 'pal', 'm'];
-  const APP_VERSION = '0.7.0';
+  const APP_VERSION = '0.8.0';
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -1678,14 +1678,20 @@
     const totalNet = round2(Object.values(byVat).reduce((s, x) => s + x.net, 0)), totalVat = round2(Object.values(byVat).reduce((s, x) => s + x.vatAmt, 0));
     const missing = lines.filter(l => l.price == null);
     const money = (n) => fmtMoney(n, wh);
+    const total = round2(totalNet + totalVat);
+    // QR platba: CZ sklad → QR Platba (SPD), SK sklad → PAY by square. Při chybějících cenách by částka nebyla správná → QR se nevytvoří.
+    const iban = PayQR.resolveIban(cfg, wh);
+    const qr = missing.length ? { error: 'QR platba se nevytvořila, protože některé položky nemají cenu.' }
+      : PayQR.build({ wh, iban, bic: cfg.bic, amount: total, currency: cur, vs, due, msg: `Faktura ${o.invoiceNo || o.no}`, name: cfg.name, invoiceId: o.invoiceNo || o.no });
     el.innerHTML = `
+      ${qr.error ? `<div class="card no-print" style="border-color:var(--warn)">⚠️ ${esc(qr.error)}</div>` : ''}
       ${!cfg.name ? `<div class="card no-print" style="border-color:var(--warn)">⚠️ Chybí údaje dodavatele (název, adresa, IČO…). Doplň je v <a href="#/nastaveni">Nastavení → Fakturace</a> pro ${esc(whName(wh))}.</div>` : ''}
       ${missing.length ? `<div class="card no-print" style="border-color:var(--warn)">⚠️ Bez ceny v ${esc(cur)}: ${missing.map(l => esc(l.name)).join(', ')}. Cenu bez DPH doplň v kartě produktu a fakturu znovu otevři.</div>` : ''}
       ${o.status !== 'ready' && o.status !== 'done' ? '<div class="card no-print" style="border-color:var(--warn)">⚠️ Objednávka ještě není připravená – toto je jen náhled, faktura dostane číslo při „Ukončeno – připraveno“.</div>' : ''}
       <div class="invoice">
         <div class="inv-head">
           <div><div class="inv-title">FAKTURA</div><div class="inv-no">${esc(o.invoiceNo || 'náhled')}</div><div class="small">${whInfo(wh).flag} ${esc(whName(wh))} · objednávka ${esc(o.no)}</div></div>
-          <table class="inv-meta"><tr><td>Datum vystavení</td><td>${fmtDay(issue)}</td></tr><tr><td>Datum plnění</td><td>${fmtDay(issue)}</td></tr><tr><td>Datum splatnosti</td><td><strong>${fmtDay(due)}</strong></td></tr><tr><td>Variabilní symbol</td><td>${esc(vs)}</td></tr>${cfg.bank ? `<tr><td>Účet / IBAN</td><td>${esc(cfg.bank)}</td></tr>` : ''}</table>
+          <table class="inv-meta"><tr><td>Datum vystavení</td><td>${fmtDay(issue)}</td></tr><tr><td>Datum plnění</td><td>${fmtDay(issue)}</td></tr><tr><td>Datum splatnosti</td><td><strong>${fmtDay(due)}</strong></td></tr><tr><td>Variabilní symbol</td><td>${esc(vs)}</td></tr>${cfg.bank ? `<tr><td>Účet</td><td>${esc(cfg.bank)}</td></tr>` : ''}</table>
         </div>
         <div class="inv-parties">
           <div class="inv-party"><div class="inv-lbl">Dodavatel</div><strong>${esc(cfg.name || '—')}</strong><div>${esc(cfg.address || '').replace(/\n/g, '<br>')}</div>${cfg.ico ? `<div>IČO: ${esc(cfg.ico)}</div>` : ''}${cfg.dic ? `<div>DIČ / IČ DPH: ${esc(cfg.dic)}</div>` : ''}</div>
@@ -1699,9 +1705,14 @@
           <table>
             ${Object.values(byVat).sort((a, b) => a.vat - b.vat).map(x => `<tr><td>Základ DPH ${fmtQty(x.vat)} %</td><td class="num">${money(x.net)}</td><td>DPH ${fmtQty(x.vat)} %</td><td class="num">${money(x.vatAmt)}</td></tr>`).join('')}
             <tr><td>Celkem bez DPH</td><td class="num">${money(totalNet)}</td><td>DPH celkem</td><td class="num">${money(totalVat)}</td></tr>
-            <tr class="inv-sum"><td colspan="3">Celkem k úhradě</td><td class="num">${money(round2(totalNet + totalVat))}</td></tr>
+            <tr class="inv-sum"><td colspan="3">Celkem k úhradě</td><td class="num">${money(total)}</td></tr>
           </table>
         </div>
+        ${qr.svg ? `<div class="inv-pay">
+          <div class="inv-qr"><div class="inv-qr-code">${qr.svg}</div><div class="inv-qr-lbl">${esc(qr.label)}</div></div>
+          <table class="inv-meta"><tr><td>Částka k úhradě</td><td><strong>${money(total)}</strong></td></tr><tr><td>IBAN</td><td>${esc(PayQR.fmtIban(qr.iban))}</td></tr>${cfg.bic ? `<tr><td>BIC / SWIFT</td><td>${esc(cfg.bic.toUpperCase())}</td></tr>` : ''}<tr><td>Variabilní symbol</td><td>${esc(vs)}</td></tr><tr><td>Splatnost</td><td>${fmtDay(due)}</td></tr>
+            <tr><td colspan="2" class="small" style="white-space:normal;color:#444;padding-top:4px">${wh === 'SK' ? 'Zaplaťte naskenovaním QR kódu v mobilnej aplikácii svojej banky.' : 'Zaplaťte naskenováním QR kódu v mobilní aplikaci své banky.'}</td></tr></table>
+        </div>` : ''}
         ${o.invoiceNote ? `<div class="inv-note">${esc(o.invoiceNote)}</div>` : ''}
         <div class="inv-foot">${esc(cfg.footer || '')}${o.preparedBy ? `<div class="small muted">Vystavil: ${esc(o.preparedBy)}${o.preparedAt ? ' · ' + fmtDate(o.preparedAt) : ''}</div>` : ''}</div>
       </div>
@@ -1796,7 +1807,9 @@
             <div class="field"><label>Adresa</label><input data-inv="${w.id}.address" value="${esc(c.address || '')}" placeholder="Ulice 1, 110 00 Praha"></div>
             <div class="field"><label>IČO</label><input data-inv="${w.id}.ico" value="${esc(c.ico || '')}"></div>
             <div class="field"><label>DIČ / IČ DPH</label><input data-inv="${w.id}.dic" value="${esc(c.dic || '')}"></div>
-            <div class="field"><label>Bankovní účet / IBAN</label><input data-inv="${w.id}.bank" value="${esc(c.bank || '')}"></div>
+            <div class="field"><label>Bankovní účet (jak se tiskne na fakturu)</label><input data-inv="${w.id}.bank" value="${esc(c.bank || '')}" placeholder="${w.id === 'SK' ? 'např. 1234567890/1100' : 'např. 123456789/0800'}"></div>
+            <div class="field"><label>IBAN – pro ${w.id === 'SK' ? 'PAY by square' : 'QR Platbu'} na faktuře</label><input data-inv="${w.id}.iban" value="${esc(c.iban || '')}" placeholder="${w.id === 'SK' ? 'SK.. .... .... .... .... ....' : 'CZ.. .... .... .... .... ....'}" autocapitalize="characters"><div class="small" data-ibanhint="${w.id}"></div></div>
+            <div class="field"><label>BIC / SWIFT (nepovinné)</label><input data-inv="${w.id}.bic" value="${esc(c.bic || '')}" placeholder="např. ${w.id === 'SK' ? 'TATRSKBX' : 'GIBACZPX'}" autocapitalize="characters"></div>
             <div class="field"><label>Výchozí DPH (%) – když ji produkt nemá</label><input data-inv="${w.id}.vat" type="number" step="any" min="0" max="100" value="${esc(c.vat ?? '')}" placeholder="0"></div>
             <div class="field"><label>Splatnost (dní)</label><input data-inv="${w.id}.dueDays" type="number" min="0" value="${esc(c.dueDays ?? 14)}"></div>
             <div class="field"><label>Text na konci faktury</label><input data-inv="${w.id}.footer" value="${esc(c.footer || '')}" placeholder="např. Děkujeme za objednávku."></div>
@@ -1858,8 +1871,17 @@
     $('#invSave').onclick = async () => {
       const inv = JSON.parse(JSON.stringify(state.settings.invoice || {}));
       $$('[data-inv]', el).forEach(i => { const [w, k] = i.dataset.inv.split('.'); inv[w] = inv[w] || {}; inv[w][k] = i.value.trim(); });
-      await setSetting('invoice', inv); toast('Fakturační údaje uloženy');
+      await setSetting('invoice', inv); toast('Fakturační údaje uloženy'); ibanHints();
     };
+    // Kontrola IBAN pro QR platbu přímo v nastavení (IBAN se případně dopočítá z čísla účtu).
+    const ibanHints = () => WAREHOUSES.forEach(w => {
+      const h = $(`[data-ibanhint="${w.id}"]`, el); if (!h) return;
+      const iban = PayQR.resolveIban({ iban: $(`[data-inv="${w.id}.iban"]`, el).value, bank: $(`[data-inv="${w.id}.bank"]`, el).value }, w.id);
+      h.innerHTML = !iban ? '<span class="muted">Bez IBAN nebude na fakturách QR kód pro platbu.</span>'
+        : PayQR.ibanValid(iban) ? `<span style="color:var(--ok)">✓ QR platba na účet ${esc(PayQR.fmtIban(iban))}</span>`
+        : '<span style="color:var(--danger)">✖ IBAN není platný – zkontroluj ho</span>';
+    });
+    $$('[data-inv$=".iban"], [data-inv$=".bank"]', el).forEach(i => i.addEventListener('input', ibanHints)); ibanHints();
     $('#setTheme').onchange = (e) => { const v = e.target.value; if (v === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = v; try { localStorage.setItem('theme', v); } catch (_) {} };
     $('#setDefQty').onchange = (e) => setSetting('defaultQty', Number(e.target.value) || 1);
 
