@@ -73,7 +73,9 @@ function RemoteDB(client) {
       if (store === 'drafts') return LocalDB.getAll(store);
       const out = []; let from = 0;
       while (true) {
-        const r = fail(await client.from(store).select('id,data').range(from, from + 999));
+        let q = client.from(store).select('id,data');
+        if (store === 'settings') q = q.not('id', 'like', 'photo:%'); // fotky škod se stahují až při otevření dokladu
+        const r = fail(await q.range(from, from + 999));
         out.push(...r.data.map(x => rowToObj(store, x)));
         if (r.data.length < 1000) break; from += 1000;
       }

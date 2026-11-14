@@ -11,11 +11,20 @@
   const fmtQty = (n) => Number(n).toLocaleString('cs-CZ', { maximumFractionDigits: 3 });
   const normCode = (c) => String(c ?? '').trim();
 
-  const TYPE_LABEL = { receipt: 'Příjem', issue: 'Výdej', inventory: 'Inventura', adjust: 'Korekce', transfer: 'Přesun' };
+  const TYPE_LABEL = { receipt: 'Příjem', issue: 'Výdej', inventory: 'Inventura', adjust: 'Korekce', transfer: 'Přesun', damage: 'Škoda' };
   const ORDER_STATUS = { new: 'Nová', preparing: 'Připravuje se', ready: 'Připraveno', done: 'Vydáno', cancelled: 'Zrušeno' };
-  const TYPE_BADGE = { receipt: 'ok', issue: 'warn', inventory: 'neutral', adjust: 'neutral', transfer: 'neutral' };
+  const TYPE_BADGE = { receipt: 'ok', issue: 'warn', inventory: 'neutral', adjust: 'neutral', transfer: 'neutral', damage: 'danger' };
+  /** Důvody škody – skladník vybírá velkým tlačítkem. */
+  const DAMAGE_REASONS = [
+    { id: 'broken', icon: '💥', label: 'Rozbité' },
+    { id: 'rotten', icon: '🦠', label: 'Shnilé / zkažené' },
+    { id: 'expired', icon: '📅', label: 'Prošlé' },
+    { id: 'other', icon: '✏️', label: 'Jiné' }
+  ];
+  const reasonInfo = (id) => DAMAGE_REASONS.find(r => r.id === id) || { id, icon: '⚠️', label: id || 'neuvedeno' };
+  const reasonBadge = (id) => `<span class="badge reason-${esc(id)}">${reasonInfo(id).icon} ${esc(reasonInfo(id).label)}</span>`;
   const UNITS = ['ks', 'kg', 'g', 'l', 'ml', 'bal', 'krt', 'pal', 'm'];
-  const APP_VERSION = '0.8.0';
+  const APP_VERSION = '0.11.0';
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -124,7 +133,7 @@
     state.products = p.map(migrateProduct).sort((a, b) => a.name.localeCompare(b.name, 'cs'));
     state.movements = m.map(x => { x.wh = x.wh || 'CZ'; return x; }).sort((a, b) => b.ts - a.ts);
     state.orders = o.map(x => { x.wh = x.wh || 'CZ'; return x; }).sort((a, b) => b.ts - a.ts);
-    state.settings = Object.fromEntries(s.map(x => [x.key, x.value]));
+    state.settings = Object.fromEntries(s.filter(x => !String(x.key).startsWith('photo:')).map(x => [x.key, x.value])); // fotky škod se načítají až při otevření
     updateBadges();
   }
   function updateBadges() {
@@ -245,6 +254,9 @@
     i.ssccs && i.ssccs.length ? 'paleta SSCC ' + i.ssccs.join(', ') : '',
     i.lot ? 'vybraná trvanlivost ' + lotLabel(i.lot.useBy) : '',
     i.batches && i.batches.some(b => b.useBy) ? 'šarže ' + [...new Set(i.batches.filter(b => b.useBy).map(b => fmtDay(b.useBy)))].join(', ') : '',
+    i.reason ? 'důvod: ' + reasonInfo(i.reason).label : '',
+    i.packQty && i.packs ? `${fmtQty(i.packs)} krt po ${fmtQty(i.packQty)}` : '',
+    i.reason && i.note ? 'pozn.: ' + i.note : '',
     i.manual ? 'bez skenu' : '',
     i.whTo ? `→ ${i.whTo}: před ${fmtQty(i.toBefore)}, po ${fmtQty(i.toAfter)}` : ''
   ].filter(Boolean).join(' · ');
@@ -252,13 +264,13 @@
   /** Číslo dokladu – každý sklad má vlastní řadu, např. P-CZ-2026-0001. */
   async function nextDocNo(type, wh = state.wh) {
     const key = `seq_${wh}`; const seq = (state.settings[key] || 0) + 1; await setSetting(key, seq);
-    const prefix = { receipt: 'P', issue: 'V', inventory: 'I', adjust: 'K', transfer: 'T' }[type];
+    const prefix = { receipt: 'P', issue: 'V', inventory: 'I', adjust: 'K', transfer: 'T', damage: 'S' }[type];
     return `${prefix}-${wh}-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`;
   }
   /** Upraví stav a šarže produktu ve skladu `wh` podle řádku a vrátí řádek dokladu (stav před / změna / po). Přesun navíc přičte do `whTo`. */
   function applyLine(p, type, it, wh = state.wh, whTo = null) {
     const before = stockOf(p, wh); const qty = Number(it.qty);
-    const after = round3(type === 'receipt' ? before + qty : (type === 'issue' || type === 'transfer') ? before - qty : qty); // inventura / korekce = nastavit stav
+    const after = round3(type === 'receipt' ? before + qty : (type === 'issue' || type === 'transfer' || type === 'damage') ? before - qty : qty); // inventura / korekce = nastavit stav
     const diff = round3(after - before);
     const line = { productId: p.id, code: p.code, name: p.name, unit: p.unit, qty, before, after, diff, wh };
     if (type === 'transfer' && whTo) {
@@ -274,6 +286,7 @@
     else if (diff < 0) { line.batches = takeFromBatches(p, -diff, wh, it.lot || null); if (it.lot) line.lot = it.lot; }
     if (it.weights) line.weights = it.weights;
     if (it.ssccs && it.ssccs.length) line.ssccs = it.ssccs;
+    if (type === 'damage') { line.reason = it.reason || 'other'; if (it.note) line.note = it.note; if (it.photoId) line.photoId = it.photoId; if (it.lotNo) line.lotNo = it.lotNo; if (it.packQty) { line.packQty = it.packQty; line.packs = it.packs; } }
     if (it.prodDate) p.lastProdDate = it.prodDate;
     if (it.useBy) p.lastUseBy = it.useBy;
     setStockOf(p, wh, after); p.updatedAt = Date.now();
@@ -288,6 +301,91 @@
     await DB.applyMovement(movement, touched);
     await loadAll();
     return movement;
+  }
+
+  // ---------- Škody (rozbité / shnilé / prošlé zboží) ----------
+  /* Skladník zapíše poškozené zboží (karton nebo kusy) → odepíše se ze skladu jako doklad S-CZ-2026-0001.
+   * Fotka se ukládá zvlášť (settings `photo:<id>`), aby se při startu appky nestahovaly všechny fotky. */
+  async function savePhoto(dataUrl) {
+    if (!dataUrl) return null;
+    const id = uid(); await DB.put('settings', { key: 'photo:' + id, value: dataUrl }); photoCache[id] = dataUrl; return id;
+  }
+  const photoCache = {};
+  async function loadPhoto(id) {
+    if (!id) return null; if (photoCache[id]) return photoCache[id];
+    try { const r = await DB.get('settings', 'photo:' + id); return (photoCache[id] = r ? r.value : null); } catch (_) { return null; }
+  }
+  /** Fotka z mobilu zmenšená na max. 1024 px (~50–100 kB), aby šla rychle uložit i přes mobilní data. */
+  async function photoToDataUrl(file, max = 1024) {
+    const bmp = await createImageBitmap(file); const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
+    const c = document.createElement('canvas'); c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    return c.toDataURL('image/jpeg', 0.6);
+  }
+  function showPhoto(src, title = 'Fotka') {
+    return dialog(`<div class="modal-head"><strong>📷 ${esc(title)}</strong><button class="iconbtn" data-close>✕</button></div><img class="dmg-photo-big" src="${src}" alt="fotka škody">`);
+  }
+  /** Okno „Zapsat škodu“: důvod, množství (kartony + kusy), šarže, fotka, poznámka.
+   *  lot = šarže daná předem (příjem); jinak se u více šarží ve skladu vybírá. Vrací { qty, reason, note, photo, lot, lotNo, packs, packQty } nebo null. */
+  async function damageDialog(p, { pack = null, g = null, wh = state.wh, lot = null, lotNo = null, title = null, extraHtml = '', atReceipt = false } = {}) {
+    const carton = pack || (p.packs || []).filter(k => Number(k.qty) > 1).sort((a, b) => b.qty - a.qty)[0] || null;
+    const weighed = isWeighed(p);
+    const gq = g ? gs1Qty({ p, pack, gs1: g }) : null;
+    const lots = atReceipt || lot ? [] : lotsOf(p, wh);
+    const preLot = lot || (g && g.useBy && lots.some(l => l.useBy === g.useBy) ? { useBy: g.useBy } : null);
+    let photo = null;
+    return new Promise((resolve) => {
+      dialog(`
+        <div class="modal-head"><strong>⚠️ ${esc(title || 'Škoda: ' + p.name)}</strong><button class="iconbtn" data-close>✕</button></div>
+        <div class="muted mono small" style="margin-bottom:8px">${esc(p.code)} · skladem ${fmtQty(stockOf(p, wh))} ${esc(p.unit)} ${whBadge(wh)}</div>
+        ${extraHtml}
+        <label class="lbl-strong">Co se stalo?</label>
+        <div class="reason-grid">${DAMAGE_REASONS.map(r => `<button type="button" class="reason-btn" data-reason="${r.id}"><span>${r.icon}</span>${esc(r.label)}</button>`).join('')}</div>
+        <input type="hidden" name="reason" value="">
+        ${carton && !weighed ? `
+          <div class="grid2" style="margin-top:12px">
+            <div class="field"><label>Celé kartony (po ${fmtQty(carton.qty)} ${esc(p.unit)})</label><input name="packs" type="number" step="1" min="0" inputmode="numeric" value="${pack ? (g && g.count && g.contentGtin ? g.count : 1) : 0}"></div>
+            <div class="field"><label>Jednotlivé kusy (${esc(p.unit)})</label><input name="loose" type="number" step="any" min="0" inputmode="decimal" value="${pack ? 0 : 1}"></div>
+          </div>
+          <div class="pack-note">Odepíše se celkem <strong id="dmgTotal">0</strong> ${esc(p.unit)}</div>`
+        : `<div class="field" style="margin-top:12px"><label>Množství (${esc(p.unit)})</label><input name="loose" type="number" step="any" min="0" inputmode="decimal" value="${gq || (weighed ? '' : 1)}"></div>`}
+        ${lots.length > 1 ? `<div class="field"><label>Která šarže / trvanlivost je poškozená</label><select name="lot">${lotOptions(p, wh, preLot, p.unit)}</select></div>` : ''}
+        <div class="field"><label>Fotka (volitelné)</label>
+          <div class="row"><label class="btn secondary" style="margin:0">📸 Vyfotit<input type="file" accept="image/*" capture="environment" id="dmgFile" hidden></label><span class="muted small" id="dmgPhotoInfo">bez fotky</span></div>
+          <img id="dmgPrev" class="dmg-photo hidden" alt="náhled fotky"></div>
+        <div class="field"><label>Poznámka (volitelné)</label><input name="note" placeholder="např. spadlo z palety, plíseň, promáčknutý karton…" autocomplete="off"></div>
+        <div class="row" style="justify-content:flex-end"><button type="button" class="btn secondary" data-close>Zrušit</button><button type="button" class="btn danger" id="dmgOk">⚠️ Zapsat do škod</button></div>`, {
+        onOpen(card, close) {
+          const num = (v) => Number(String(v || '').replace(',', '.')) || 0;
+          const total = () => carton && !weighed ? round3(num($('[name=packs]', card).value) * carton.qty + num($('[name=loose]', card).value)) : num($('[name=loose]', card).value);
+          const upd = () => { const t = $('#dmgTotal', card); if (t) t.textContent = fmtQty(total()); };
+          $$('[name=packs],[name=loose]', card).forEach(i => i.oninput = upd); upd();
+          $$('[data-reason]', card).forEach(b => b.onclick = () => { $('[name=reason]', card).value = b.dataset.reason; $$('[data-reason]', card).forEach(x => x.classList.toggle('active', x === b)); });
+          $('#dmgFile', card).onchange = async (e) => {
+            const f = e.target.files && e.target.files[0]; if (!f) return;
+            $('#dmgPhotoInfo', card).textContent = 'zpracovávám…';
+            try { photo = await photoToDataUrl(f); $('#dmgPrev', card).src = photo; $('#dmgPrev', card).classList.remove('hidden'); $('#dmgPhotoInfo', card).textContent = '✓ fotka přidána (lze vyfotit znovu)'; }
+            catch (_) { $('#dmgPhotoInfo', card).textContent = 'fotku se nepodařilo načíst'; }
+          };
+          $('#dmgOk', card).onclick = () => {
+            const v = collect(card);
+            if (!v.reason) { toast('Vyber, co se stalo (rozbité / shnilé / prošlé / jiné)'); return; }
+            const q = total(); if (!(q > 0)) { toast('Zadej množství'); return; }
+            const packs = carton && !weighed ? num(v.packs) : 0;
+            close('ok');
+            resolve({ qty: q, reason: v.reason, note: (v.note || '').trim(), photo, lot: lots.length > 1 ? lotFromVal(v.lot || '') : preLot, lotNo: lotNo || (g && g.lot) || null,
+              packs, packQty: packs ? carton.qty : 0 });
+          };
+        }
+      }).then(r => { if (r !== 'ok') resolve(null); });
+    });
+  }
+  /** Zapíše škodu jako doklad S-… (odpis ze skladu). items: výsledky damageDialog + productId. */
+  async function commitDamage(items, meta = {}) {
+    const lines = [];
+    for (const it of items) lines.push({ productId: it.productId, qty: it.qty, reason: it.reason, note: it.note || '', photoId: it.photoId || (it.photo ? await savePhoto(it.photo) : null), lot: it.lot || null, lotNo: it.lotNo || null, packs: it.packs || 0, packQty: it.packQty || 0 });
+    const reasons = [...new Set(lines.map(l => l.reason))];
+    return commitMovement('damage', lines, { reason: reasons.length === 1 ? reasons[0] : 'mixed', ...meta });
   }
 
   // ---------- Rozpracované doklady (přežijí zavření appky) ----------
@@ -819,6 +917,7 @@
           <a class="btn secondary" href="#/vydej">⬆️ Nový výdej</a>
           <a class="btn secondary" href="#/inventura">📋 Inventura</a>
           <a class="btn secondary" href="#/presun">⇄ Přesun ${wh} → ${otherWh(wh)}</a>
+          <a class="btn secondary" href="#/skody">⚠️ Zapsat škodu</a>
           <button class="btn secondary" id="dashAdd">＋ Produkt</button>
         </div>
       </div>
@@ -911,6 +1010,7 @@
           <button class="btn secondary" id="pEdit">✏️ Upravit</button>
           <button class="btn secondary" id="pAdjust">🔧 Opravit stav ${state.wh}</button>
           <a class="btn secondary" href="#/presun?pid=${p.id}">⇄ Přesun</a>
+          <a class="btn secondary" href="#/skody?pid=${p.id}">⚠️ Škoda</a>
           <a class="btn secondary" href="#/produkty">← Zpět</a>
         </div>
       </div>
@@ -947,6 +1047,7 @@
       // Rozpracovaný doklad je zvlášť pro každý sklad; přesun má jeden s vlastním směrem.
       const key = type === 'transfer' ? 'draft:transfer' : `draft:${type}:${state.wh}`;
       let draft = (await drafts.get(key)) || { items: [], partner: '', note: '', from: state.wh };
+      draft.damages = draft.damages || []; // příjem: poškozené zboží z dodávky → po uložení doklad škody S-…
       if (!WAREHOUSES.some(w => w.id === draft.from)) draft.from = state.wh;
       const whFrom = () => (type === 'transfer' ? draft.from : state.wh);
       const whTo = () => otherWh(whFrom());
@@ -1061,6 +1162,12 @@
         $$('[data-inc]', el).forEach(b => b.onclick = async () => { draft.items[b.dataset.inc].qty = Number(draft.items[b.dataset.inc].qty) + 1; await save(); draw(); });
         $$('[data-dec]', el).forEach(b => b.onclick = async () => { const it = draft.items[b.dataset.dec]; it.qty = Math.max(0, Number(it.qty) - 1); if (it.qty === 0) draft.items.splice(b.dataset.dec, 1); await save(); draw(); });
         $$('[data-del]', el).forEach(b => b.onclick = async () => { draft.items.splice(b.dataset.del, 1); await save(); draw(); });
+        const dd = $('#docDamages', el);
+        if (dd) {
+          dd.innerHTML = draft.damages.length ? `<div class="card dmg-box"><h2>⚠️ Poškozené z dodávky</h2><p class="muted small" style="margin-top:0">Po uložení příjmu se tohle odepíše ze skladu jako škoda (samostatný doklad S-…).</p>
+            <div class="list">${draft.damages.map((d, idx) => { const p = productById(d.productId); return p ? `<div class="item"><div class="grow"><div class="name">${esc(p.name)} <span class="dmg-qty">−${fmtQty(d.qty)} ${esc(p.unit)}</span></div><div class="small">${reasonBadge(d.reason)}${d.lot && d.lot.useBy ? ' · šarže do ' + fmtDay(d.lot.useBy) : ''}${d.photo ? ' · 📷' : ''}${d.note ? ' · ' + esc(d.note) : ''}</div></div><button class="iconbtn" data-ddel="${idx}" title="Odebrat">🗑</button></div>` : ''; }).join('')}</div></div>` : '';
+          $$('[data-ddel]', dd).forEach(b => b.onclick = async () => { draft.damages.splice(b.dataset.ddel, 1); await save(); draw(); });
+        }
       };
 
       el.innerHTML = `
@@ -1072,12 +1179,14 @@
             <button class="btn big grow" id="docScan">📷 ${labels.scan}</button>
             <button class="btn secondary" id="docPick" title="Vybrat ze seznamu" style="min-height:52px">📋</button>
           </div>
+          ${type === 'receipt' ? '<button class="btn secondary dmg-btn" id="docDamage">⚠️ Zapsat poškozené / zkažené z této dodávky</button>' : ''}
           <div class="grid2" style="margin-top:12px">
             ${labels.partner ? `<div class="field"><label>${labels.partner}</label><input id="docPartner" value="${esc(draft.partner || '')}" placeholder="volitelné"></div>` : ''}
             <div class="field"><label>${type === 'transfer' ? 'Poznámka / důvod přesunu' : 'Poznámka / číslo dodacího listu'}</label><input id="docNote" value="${esc(draft.note || '')}" placeholder="volitelné"></div>
           </div>
         </div>
         <div class="list" id="docItems"></div>
+        <div id="docDamages"></div>
         <div class="sticky-actions">
           <div class="row between" style="margin-bottom:6px"><span class="muted small" id="docSummary"></span><button class="btn sm secondary" id="docClear">Zahodit</button></div>
           <button class="btn big ok" id="docCommit">✅ ${labels.verb} a uložit doklad</button>
@@ -1092,7 +1201,41 @@
       $('#docScan').onclick = () => scanner.open(labels.scan, addCode);
       pageScan = addCode;
       $('#docPick').onclick = async () => { const p = await pickProduct(); if (p) { await addCode(p.code); } };
-      $('#docClear').onclick = async () => { if (draft.items.length && !await confirmDlg('Zahodit doklad', 'Rozpracovaný doklad bude smazán.', 'Zahodit', true)) return; draft = { items: [], partner: '', note: '', from: draft.from }; await drafts.clear(key); draw(); };
+      /** Příjem: poškozené zboží z dodávky. Řádek příjmu (produkt + šarže) jde vybrat ťuknutím, jinak sken / seznam. */
+      const addDamage = async (p, { pack = null, g = null, row = null } = {}) => {
+        const rows = draft.items.filter(i => i.productId === p.id);
+        const r0 = row || (g && g.useBy ? rows.find(i => i.useBy === g.useBy) : null) || rows[0] || null;
+        const res = await damageDialog(p, { pack, g, wh: whFrom(), atReceipt: true, lot: r0 ? { useBy: r0.useBy || null } : null, lotNo: r0 ? r0.lotNo || null : null,
+          title: `Poškozené: ${p.name}`, extraHtml: r0 ? `<p class="pack-note">Z dodávky: ${fmtQty(r0.qty)} ${esc(p.unit)}${r0.useBy ? ' · do ' + fmtDay(r0.useBy) : ''}${r0.lotNo ? ' · šarže ' + esc(r0.lotNo) : ''}</p>` : '<p class="pack-note" style="border-color:#e0a800">Tohle zboží zatím v příjmu není. Přijmi nejdřív celé množství (i s poškozenými kusy), poškozené se pak odepíšou zvlášť.</p>' });
+        if (!res) return false;
+        draft.damages.push({ productId: p.id, ...res }); await save(); draw();
+        toast(`⚠️ ${p.name}: −${fmtQty(res.qty)} ${p.unit} do škod (zapíše se při uložení příjmu)`, 3500);
+        return true;
+      };
+      const damageCode = async (code) => {
+        const scanning = !$('#scanModal').classList.contains('hidden');
+        const hit = lookupCode(code);
+        if (!hit) { scanner.feedback(`Neznámý kód ${code} – nejdřív ho přijmi`, false); return; }
+        if (scanning) { scanner.feedback(`✓ ${hit.p.name}`, true); await scanner.close(); }
+        await addDamage(hit.p, { pack: hit.pack, g: hit.gs1 || null });
+      };
+      const dmgBtn = $('#docDamage');
+      if (dmgBtn) dmgBtn.onclick = async () => {
+        const choice = await dialog(`
+          <div class="modal-head"><strong>⚠️ Poškozené z dodávky</strong><button class="iconbtn" data-close>✕</button></div>
+          <p class="muted small" style="margin-top:0">Co je poškozené? Ťukni na zboží z příjmu, nebo naskenuj rozbitý karton / kus.</p>
+          <div class="list">
+            ${draft.items.map((i, idx) => { const p = productById(i.productId); return p ? `<button type="button" class="btn secondary big" data-dr="${idx}" style="text-align:left">${esc(p.name)} <span class="muted small">· ${fmtQty(i.qty)} ${esc(p.unit)}${i.useBy ? ' · do ' + fmtDay(i.useBy) : ''}</span></button>` : ''; }).join('')}
+            <button type="button" class="btn big danger" id="drScan">📷 Naskenovat poškozené</button>
+            <button type="button" class="btn secondary" id="drPick">📋 Vybrat ze seznamu</button>
+          </div>`, { onOpen(card, close) { $('#drScan', card).onclick = () => close('scan'); $('#drPick', card).onclick = () => close('pick'); $$('[data-dr]', card).forEach(b => b.onclick = () => close('row:' + b.dataset.dr)); } });
+        if (!choice) return;
+        if (choice === 'scan') return scanner.open('Skenuj poškozené zboží', damageCode);
+        if (choice === 'pick') { const p = await pickProduct(); if (p) await addDamage(p); return; }
+        const row = draft.items[Number(String(choice).slice(4))]; const p = row && productById(row.productId);
+        if (p) await addDamage(p, { row });
+      };
+      $('#docClear').onclick = async () => { if (draft.items.length && !await confirmDlg('Zahodit doklad', 'Rozpracovaný doklad bude smazán.', 'Zahodit', true)) return; draft = { items: [], damages: [], partner: '', note: '', from: draft.from }; await drafts.clear(key); draw(); };
       $('#docCommit').onclick = async () => {
         if (!draft.items.length) return;
         if (type !== 'receipt') {
@@ -1100,8 +1243,14 @@
           if (short.length && !await confirmDlg('Nedostatek zásob', `${short.length} položek by ve skladu ${whName(whFrom())} šlo do mínusu. Přesto ${type === 'transfer' ? 'přesunout' : 'vydat'}?`, labels.verb)) return;
         }
         const m = await commitMovement(type, draft.items, { partner: (draft.partner || '').trim(), note: (draft.note || '').trim(), wh: whFrom(), whTo: type === 'transfer' ? whTo() : null });
+        let dm = null;
+        if (type === 'receipt' && draft.damages.length) {
+          // Nejdřív se přijme celá dodávka, pak se poškozené odepíše jako škoda s odkazem na příjemku (podklad k reklamaci u dodavatele).
+          try { dm = await commitDamage(draft.damages, { wh: whFrom(), partner: (draft.partner || '').trim(), note: `Poškozeno při příjmu ${m.docNo}`, receiptId: m.id, receiptDocNo: m.docNo }); }
+          catch (err) { toast('Příjem uložen, ale škodu se nepodařilo zapsat: ' + err.message, 6000); }
+        }
         await drafts.clear(key);
-        toast(`${labels.title} ${m.docNo} uložen`);
+        toast(`${labels.title} ${m.docNo} uložen${dm ? ` · škoda ${dm.docNo}` : ''}`, dm ? 4000 : 2200);
         showMovement(m.id); location.hash = '#/historie';
       };
 
@@ -1113,6 +1262,97 @@
   routes['/prijem'] = docView('receipt');
   routes['/vydej'] = docView('issue');
   routes['/presun'] = docView('transfer');
+
+  // ---------- Škody: mobil zapisuje, kancl na PC vidí přehled ----------
+  let dmgFilter = { period: 'month', wh: 'all', reason: 'all' };
+  /** Řádky škod (jeden řádek = jeden produkt v dokladu S-…), nejnovější nahoře. */
+  const damageRows = () => state.movements.filter(m => m.type === 'damage').flatMap(m => m.items.map(i => ({ m, i })));
+  const periodRange = (k) => {
+    const d = new Date(); const y = d.getFullYear(), mo = d.getMonth();
+    if (k === 'month') return [new Date(y, mo, 1).getTime(), Infinity];
+    if (k === 'prev') return [new Date(y, mo - 1, 1).getTime(), new Date(y, mo, 1).getTime()];
+    if (k === 'year') return [new Date(y, 0, 1).getTime(), Infinity];
+    return [0, Infinity];
+  };
+  const PERIODS = [['month', 'Tento měsíc'], ['prev', 'Minulý měsíc'], ['year', 'Letos'], ['all', 'Vše']];
+  /** Hodnota škody bez DPH podle ceny z karty produktu (v měně skladu); null když produkt nemá cenu. */
+  const damageValue = (m, i) => { const pr = priceOf(productById(i.productId), m.wh); return pr == null ? null : round2(pr * Math.abs(i.diff)); };
+
+  routes['/skody'] = async (el, params) => {
+    setTitle('Škody');
+    const wh = state.wh;
+    const [from, to] = periodRange(dmgFilter.period);
+    const rows = damageRows().filter(({ m, i }) => m.ts >= from && m.ts < to && (dmgFilter.wh === 'all' || m.wh === dmgFilter.wh) && (dmgFilter.reason === 'all' || i.reason === dmgFilter.reason));
+    const byWh = WAREHOUSES.map(w => { const rs = rows.filter(r => r.m.wh === w.id); const vals = rs.map(r => damageValue(r.m, r.i)); return { w, n: rs.length, value: vals.reduce((s, v) => s + (v || 0), 0), noPrice: vals.filter(v => v == null).length }; }).filter(x => x.n);
+    const byReason = DAMAGE_REASONS.map(r => ({ r, n: rows.filter(x => x.i.reason === r.id).length })).filter(x => x.n);
+
+    el.innerHTML = `
+      <div class="card dmg-entry">
+        <div class="muted small" style="margin-bottom:10px">Zápis škody do skladu: <strong>${whInfo(wh).flag} ${esc(whName(wh))}</strong> · <a href="#" id="dmgWh">přepnout sklad</a></div>
+        <div class="row">
+          <button class="btn big danger grow" id="dmgScan">📷 Naskenovat poškozené zboží</button>
+          <button class="btn secondary" id="dmgPick" title="Vybrat ze seznamu" style="min-height:52px">📋</button>
+        </div>
+        <p class="muted small" style="margin-bottom:0">Naskenuj rozbitý karton nebo kus, vyber co se stalo (rozbité, shnilé, prošlé…) a kolik. Zboží se hned odepíše ze skladu jako škoda (doklad S-${esc(wh)}-…). Poškozené zboží z právě přijaté palety zapíšeš rovnou v Příjmu.</p>
+      </div>
+      <div class="row between" style="margin:4px 0 8px"><h2 style="margin:0">Přehled škod</h2><button class="btn sm secondary" id="dmgCsv" ${rows.length ? '' : 'disabled'}>⬇ CSV</button></div>
+      <div class="chips">${PERIODS.map(([k, l]) => `<span class="chip ${dmgFilter.period === k ? 'active' : ''}" data-per="${k}">${l}</span>`).join('')}
+        <span class="grow"></span>${[['all', 'Oba sklady'], ...WAREHOUSES.map(w => [w.id, `${w.flag} ${w.id}`])].map(([k, l]) => `<span class="chip ${dmgFilter.wh === k ? 'active' : ''}" data-dwh="${k}">${l}</span>`).join('')}</div>
+      <div class="chips">${[['all', 'Všechny důvody'], ...DAMAGE_REASONS.map(r => [r.id, `${r.icon} ${r.label}`])].map(([k, l]) => `<span class="chip ${dmgFilter.reason === k ? 'active' : ''}" data-rsn="${k}">${esc(l)}</span>`).join('')}</div>
+      <div class="stats">
+        <div class="stat ${rows.length ? 'danger' : ''}"><div class="num">${rows.length}</div><div class="lbl">záznamů škod</div></div>
+        ${byWh.map(x => `<div class="stat"><div class="num">${fmtMoney(x.value, x.w.id)}</div><div class="lbl">${x.w.flag} hodnota škod bez DPH${x.noPrice ? ` · ${x.noPrice}× bez ceny` : ''}</div></div>`).join('')}
+        ${byReason.map(x => `<div class="stat"><div class="num">${x.n}</div><div class="lbl">${x.r.icon} ${esc(x.r.label)}</div></div>`).join('')}
+      </div>
+      ${rows.length ? `<div class="list">${rows.map(({ m, i }) => { const v = damageValue(m, i); return `
+        <div class="item clickable dmg-row" data-mid="${m.id}">
+          <div class="grow">
+            <div class="name">${esc(i.name)} <span class="dmg-qty">−${fmtQty(Math.abs(i.diff))} ${esc(i.unit || '')}</span>${i.packs && i.packQty ? ` <span class="muted small">(${fmtQty(i.packs)} krt)</span>` : ''}</div>
+            <div class="small">${reasonBadge(i.reason)} ${whBadge(m.wh)} ${m.receiptDocNo ? `<span class="badge neutral">při příjmu ${esc(m.receiptDocNo)}</span>` : ''} ${i.photoId ? '<span title="má fotku">📷</span>' : ''}</div>
+            <div class="code small muted">${fmtDate(m.ts)} · <span class="mono">${esc(m.docNo)}</span>${(i.batches || []).some(b => b.useBy) ? ' · šarže do ' + [...new Set(i.batches.filter(b => b.useBy).map(b => fmtDay(b.useBy)))].join(', ') : ''}${i.lotNo ? ' · LOT ' + esc(i.lotNo) : ''}${m.by ? ' · ' + esc(m.by) : ''}</div>
+            ${i.note ? `<div class="small">📝 ${esc(i.note)}</div>` : ''}
+          </div>
+          ${v != null ? `<div class="num small muted" style="white-space:nowrap">${fmtMoney(v, m.wh)}</div>` : ''}
+        </div>`; }).join('')}</div>`
+      : `<div class="empty"><div class="big">✅</div>V tomto období žádné škody.</div>`}`;
+
+    /** Naskenovaný / vybraný produkt → okno škody → hned odepsat. */
+    const addCode = async (code) => {
+      const scanning = !$('#scanModal').classList.contains('hidden');
+      let hit = lookupCode(code);
+      if (!hit) {
+        if (scanning) { scanner.feedback(`Neznámý kód ${code}`, false); await scanner.close(); }
+        hit = await resolveUnknownCode(code);
+        if (!hit) return;
+      }
+      const { p, pack } = hit; const g = hit.gs1 || null;
+      if (scanning) { scanner.feedback(`✓ ${p.name}${pack ? ' · ' + packLabel(p, pack) : ''}`, true); await scanner.pause(); }
+      const r = await damageDialog(p, { pack, g, wh });
+      if (r) {
+        if (r.qty > stockOf(p, wh) && !await confirmDlg('Víc než je skladem', `Ve skladu ${whName(wh)} je jen ${fmtQty(stockOf(p, wh))} ${p.unit}. Přesto zapsat škodu ${fmtQty(r.qty)} ${p.unit}? Stav půjde do mínusu.`, 'Zapsat')) { if (scanner.running) await scanner.resume(); return; }
+        const m = await commitDamage([{ productId: p.id, ...r }], { wh, note: r.note });
+        const msg = `⚠️ ${m.docNo}: ${p.name} −${fmtQty(r.qty)} ${p.unit} odepsáno jako škoda`;
+        if (scanning && scanner.running) { scanner.feedback(msg, true); await scanner.resume(); } else toast(msg, 3500);
+        render();
+        return;
+      }
+      if (scanner.running) await scanner.resume();
+    };
+    pageScan = addCode;
+    $('#dmgScan').onclick = () => scanner.open('Skenuj poškozené zboží', addCode);
+    $('#dmgPick').onclick = async () => { const p = await pickProduct(); if (p) await addCode(p.code); };
+    $('#dmgWh').onclick = (e) => { e.preventDefault(); $('#whBtn').click(); };
+    $$('[data-per]', el).forEach(c => c.onclick = () => { dmgFilter.period = c.dataset.per; render(); });
+    $$('[data-dwh]', el).forEach(c => c.onclick = () => { dmgFilter.wh = c.dataset.dwh; render(); });
+    $$('[data-rsn]', el).forEach(c => c.onclick = () => { dmgFilter.reason = c.dataset.rsn; render(); });
+    $$('[data-mid]', el).forEach(d => d.onclick = () => showMovement(d.dataset.mid));
+    $('#dmgCsv').onclick = () => downloadText(`skody-${new Date().toISOString().slice(0, 10)}.csv`, toCsv([['Doklad', 'Datum', 'Sklad', 'Kód', 'Produkt', 'Množství', 'Jednotka', 'Kartonů', 'Důvod', 'Trvanlivost šarže', 'LOT', 'Poznámka', 'Při příjmu', 'Dodavatel', 'Hodnota bez DPH', 'Měna', 'Zapsal'],
+      ...rows.map(({ m, i }) => [m.docNo, fmtDate(m.ts), m.wh, i.code, i.name, Math.abs(i.diff), i.unit || '', i.packs || '', reasonInfo(i.reason).label, [...new Set((i.batches || []).filter(b => b.useBy).map(b => fmtDay(b.useBy)))].join(', '), i.lotNo || '', i.note || '', m.receiptDocNo || '', m.partner || '', damageValue(m, i) ?? '', curOf(m.wh), m.by || ''])]), 'text/csv');
+
+    // Z karty produktu: „⚠️ Škoda“ rovnou otevře okno.
+    const pid = params && params.get('pid'); const pre = pid && productById(pid);
+    if (pre) { history.replaceState(null, '', '#/skody'); await addCode(pre.code); }
+  };
 
   async function pickProduct() {
     return new Promise((resolve) => {
@@ -1728,7 +1968,7 @@
     setTitle('Historie');
     const list = state.movements.filter(m => (histFilter === 'all' || m.type === histFilter) && (histWh === 'all' || m.wh === histWh || m.whTo === histWh));
     el.innerHTML = `
-      <div class="chips">${[['all', 'Vše'], ['receipt', 'Příjmy'], ['issue', 'Výdeje'], ['transfer', 'Přesuny'], ['inventory', 'Inventury'], ['adjust', 'Korekce']].map(([k, l]) => `<span class="chip ${histFilter === k ? 'active' : ''}" data-f="${k}">${l}</span>`).join('')}
+      <div class="chips">${[['all', 'Vše'], ['receipt', 'Příjmy'], ['issue', 'Výdeje'], ['transfer', 'Přesuny'], ['inventory', 'Inventury'], ['adjust', 'Korekce'], ['damage', 'Škody']].map(([k, l]) => `<span class="chip ${histFilter === k ? 'active' : ''}" data-f="${k}">${l}</span>`).join('')}
         <span class="grow"></span>${[['all', 'Oba sklady'], ...WAREHOUSES.map(w => [w.id, `${w.flag} ${w.id}`])].map(([k, l]) => `<span class="chip ${histWh === k ? 'active' : ''}" data-wh="${k}">${l}</span>`).join('')}</div>
       ${list.length ? `<div class="table-wrap card" style="padding:0"><table>
         <tr><th>Datum</th><th>Doklad</th><th>Typ</th><th>Sklad</th><th>Partner / pozn.</th><th class="num">Položek</th><th class="num">Množství</th></tr>
@@ -1748,8 +1988,16 @@
         <tr><th>Produkt</th><th class="num">Před</th><th class="num">Změna</th><th class="num">Po</th></tr>
         ${m.items.map(i => `<tr><td><div>${esc(i.name)}</div><div class="muted mono small">${esc(i.code)}</div>${lineInfo(i) ? `<div class="muted small">${esc(lineInfo(i))}</div>` : ''}</td><td class="num">${fmtQty(i.before)}</td><td class="num ${i.diff >= 0 ? 'diff-pos' : 'diff-neg'}">${i.diff >= 0 ? '+' : ''}${fmtQty(i.diff)} ${esc(i.unit || '')}</td><td class="num">${fmtQty(i.after)}</td></tr>`).join('')}
       </table></div>
+      ${m.type === 'damage' ? `<div class="dmg-detail">${m.items.map((i, idx) => `<div class="dmg-line">${reasonBadge(i.reason)} <strong>${esc(i.name)}</strong>${i.note ? ` · 📝 ${esc(i.note)}` : ''}${i.photoId ? `<div><img class="dmg-photo" data-photo="${esc(i.photoId)}" data-idx="${idx}" alt="načítám fotku…"></div>` : ''}</div>`).join('')}
+        ${m.receiptDocNo ? `<p class="small muted">Poškozeno při příjmu <a href="#" id="mvRcpt">${esc(m.receiptDocNo)}</a>${m.partner ? ' · dodavatel ' + esc(m.partner) : ''}</p>` : ''}</div>` : ''}
+      ${(() => { const d = m.type === 'receipt' && state.movements.find(x => x.receiptId === m.id); return d ? `<p class="small"><span class="badge danger">⚠️ Škoda</span> Z této dodávky odepsáno jako poškozené: <a href="#" id="mvDmg" data-id="${d.id}">${esc(d.docNo)}</a></p>` : ''; })()}
       <div class="row" style="justify-content:flex-end;margin-top:12px"><button class="btn secondary" id="mvCsv">⬇ CSV</button><button class="btn" data-close>Zavřít</button></div>`, {
-      onOpen(card) { $('#mvCsv', card).onclick = () => downloadText(`${m.docNo}.csv`, toCsv([['Doklad', 'Datum', 'Typ', 'Sklad', 'Do skladu', 'Kód', 'Produkt', 'Jednotka', 'Před', 'Změna', 'Po'], ...m.items.map(i => [m.docNo, fmtDate(m.ts), TYPE_LABEL[m.type], m.wh || '', m.whTo || '', i.code, i.name, i.unit || '', i.before, i.diff, i.after])])); }
+      onOpen(card, close) {
+        $$('[data-photo]', card).forEach(async img => { const src = await loadPhoto(img.dataset.photo); if (src) { img.src = src; img.onclick = () => showPhoto(src, m.items[img.dataset.idx].name); } else img.alt = 'fotka není k dispozici'; });
+        const rc = $('#mvRcpt', card); if (rc) rc.onclick = (e) => { e.preventDefault(); close(null); showMovement(m.receiptId); };
+        const dl = $('#mvDmg', card); if (dl) dl.onclick = (e) => { e.preventDefault(); close(null); showMovement(dl.dataset.id); };
+        $('#mvCsv', card).onclick = () => downloadText(`${m.docNo}.csv`, toCsv([['Doklad', 'Datum', 'Typ', 'Sklad', 'Do skladu', 'Kód', 'Produkt', 'Jednotka', 'Před', 'Změna', 'Po'], ...m.items.map(i => [m.docNo, fmtDate(m.ts), TYPE_LABEL[m.type], m.wh || '', m.whTo || '', i.code, i.name, i.unit || '', i.before, i.diff, i.after])]));
+      }
     });
   }
 
