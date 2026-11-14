@@ -11,11 +11,20 @@
   const fmtQty = (n) => Number(n).toLocaleString('cs-CZ', { maximumFractionDigits: 3 });
   const normCode = (c) => String(c ?? '').trim();
 
-  const TYPE_LABEL = { receipt: 'Příjem', issue: 'Výdej', inventory: 'Inventura', adjust: 'Korekce', transfer: 'Přesun' };
+  const TYPE_LABEL = { receipt: 'Příjem', issue: 'Výdej', inventory: 'Inventura', adjust: 'Korekce', transfer: 'Přesun', damage: 'Škoda' };
   const ORDER_STATUS = { new: 'Nová', preparing: 'Připravuje se', ready: 'Připraveno', done: 'Vydáno', cancelled: 'Zrušeno' };
-  const TYPE_BADGE = { receipt: 'ok', issue: 'warn', inventory: 'neutral', adjust: 'neutral', transfer: 'neutral' };
+  const TYPE_BADGE = { receipt: 'ok', issue: 'warn', inventory: 'neutral', adjust: 'neutral', transfer: 'neutral', damage: 'danger' };
+  /** Důvody škody – skladník vybírá velkým tlačítkem. */
+  const DAMAGE_REASONS = [
+    { id: 'broken', icon: '💥', label: 'Rozbité' },
+    { id: 'rotten', icon: '🦠', label: 'Shnilé / zkažené' },
+    { id: 'expired', icon: '📅', label: 'Prošlé' },
+    { id: 'other', icon: '✏️', label: 'Jiné' }
+  ];
+  const reasonInfo = (id) => DAMAGE_REASONS.find(r => r.id === id) || { id, icon: '⚠️', label: id || 'neuvedeno' };
+  const reasonBadge = (id) => `<span class="badge reason-${esc(id)}">${reasonInfo(id).icon} ${esc(reasonInfo(id).label)}</span>`;
   const UNITS = ['ks', 'kg', 'g', 'l', 'ml', 'bal', 'krt', 'pal', 'm'];
-  const APP_VERSION = '0.6.1';
+  const APP_VERSION = '0.11.1';
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -82,7 +91,7 @@
   }
 
   // ---------- Data ----------
-  const state = { products: [], movements: [], orders: [], settings: {}, user: null, wh: 'CZ' };
+  const state = { products: [], movements: [], orders: [], inbound: [], settings: {}, user: null, wh: 'CZ' };
 
   // ---------- Sklady (CZ / SK): každý má vlastní stavy, šarže, doklady i inventuru ----------
   const WAREHOUSES = [{ id: 'CZ', name: 'Sklad CZ', flag: '🇨🇿', currency: 'CZK' }, { id: 'SK', name: 'Sklad SK', flag: '🇸🇰', currency: 'EUR' }];
@@ -123,13 +132,18 @@
     const [p, m, o, s] = await Promise.all([DB.getAll('products'), DB.getAll('movements'), DB.getAll('orders'), DB.getAll('settings')]);
     state.products = p.map(migrateProduct).sort((a, b) => a.name.localeCompare(b.name, 'cs'));
     state.movements = m.map(x => { x.wh = x.wh || 'CZ'; return x; }).sort((a, b) => b.ts - a.ts);
-    state.orders = o.map(x => { x.wh = x.wh || 'CZ'; return x; }).sort((a, b) => b.ts - a.ts);
-    state.settings = Object.fromEntries(s.map(x => [x.key, x.value]));
+    const allOrders = o.map(x => { x.wh = x.wh || 'CZ'; return x; }).sort((a, b) => b.ts - a.ts);
+    // Slepý příjem (palety avizované kanclem) je ve stejné tabulce jako objednávky, odlišený `kind: 'inbound'`.
+    state.orders = allOrders.filter(x => x.kind !== 'inbound');
+    state.inbound = allOrders.filter(x => x.kind === 'inbound');
+    state.settings = Object.fromEntries(s.filter(x => !String(x.key).startsWith('photo:')).map(x => [x.key, x.value])); // fotky škod se načítají až při otevření
     updateBadges();
   }
   function updateBadges() {
     const n = state.orders.filter(o => o.status === 'new').length;
     $('#navOrders').textContent = n || ''; $('#tabOrders').textContent = n || '';
+    const pal = state.inbound.filter(x => x.status === 'open' || x.status === 'counting').length; // palety čekající na přepočítání
+    $('#navInbound').textContent = pal || ''; $('#tabInbound').textContent = pal || '';
   }
   /** Najde produkt podle hlavního kódu nebo kódu balení (karton). */
   const productByCode = (code) => { const c = normCode(code); return state.products.find(p => p.code === c || (p.packs || []).some(k => k.code === c)); };
@@ -242,8 +256,12 @@
     i.weights && i.weights.length > 1 ? 'váhy ' + i.weights.map(fmtQty).join(' + ') : '',
     i.useBy ? 'spotřeba do ' + fmtDay(i.useBy) : '',
     i.lotNo ? 'šarže ' + i.lotNo : '',
+    i.ssccs && i.ssccs.length ? 'paleta SSCC ' + i.ssccs.join(', ') : '',
     i.lot ? 'vybraná trvanlivost ' + lotLabel(i.lot.useBy) : '',
     i.batches && i.batches.some(b => b.useBy) ? 'šarže ' + [...new Set(i.batches.filter(b => b.useBy).map(b => fmtDay(b.useBy)))].join(', ') : '',
+    i.reason ? 'důvod: ' + reasonInfo(i.reason).label : '',
+    i.packQty && i.packs ? `${fmtQty(i.packs)} krt po ${fmtQty(i.packQty)}` : '',
+    i.reason && i.note ? 'pozn.: ' + i.note : '',
     i.manual ? 'bez skenu' : '',
     i.whTo ? `→ ${i.whTo}: před ${fmtQty(i.toBefore)}, po ${fmtQty(i.toAfter)}` : ''
   ].filter(Boolean).join(' · ');
@@ -251,13 +269,13 @@
   /** Číslo dokladu – každý sklad má vlastní řadu, např. P-CZ-2026-0001. */
   async function nextDocNo(type, wh = state.wh) {
     const key = `seq_${wh}`; const seq = (state.settings[key] || 0) + 1; await setSetting(key, seq);
-    const prefix = { receipt: 'P', issue: 'V', inventory: 'I', adjust: 'K', transfer: 'T' }[type];
+    const prefix = { receipt: 'P', issue: 'V', inventory: 'I', adjust: 'K', transfer: 'T', inbound: 'SP', damage: 'S' }[type];
     return `${prefix}-${wh}-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`;
   }
   /** Upraví stav a šarže produktu ve skladu `wh` podle řádku a vrátí řádek dokladu (stav před / změna / po). Přesun navíc přičte do `whTo`. */
   function applyLine(p, type, it, wh = state.wh, whTo = null) {
     const before = stockOf(p, wh); const qty = Number(it.qty);
-    const after = round3(type === 'receipt' ? before + qty : (type === 'issue' || type === 'transfer') ? before - qty : qty); // inventura / korekce = nastavit stav
+    const after = round3(type === 'receipt' ? before + qty : (type === 'issue' || type === 'transfer' || type === 'damage') ? before - qty : qty); // inventura / korekce = nastavit stav
     const diff = round3(after - before);
     const line = { productId: p.id, code: p.code, name: p.name, unit: p.unit, qty, before, after, diff, wh };
     if (type === 'transfer' && whTo) {
@@ -272,6 +290,8 @@
     else if (diff > 0) { const b = { qty: diff, prodDate: it.prodDate || null, useBy: it.useBy || null, lotNo: it.lotNo || null, wh }; addBatch(p, b); line.prodDate = b.prodDate; line.useBy = b.useBy; if (b.lotNo) line.lotNo = b.lotNo; }
     else if (diff < 0) { line.batches = takeFromBatches(p, -diff, wh, it.lot || null); if (it.lot) line.lot = it.lot; }
     if (it.weights) line.weights = it.weights;
+    if (it.ssccs && it.ssccs.length) line.ssccs = it.ssccs;
+    if (type === 'damage') { line.reason = it.reason || 'other'; if (it.note) line.note = it.note; if (it.photoId) line.photoId = it.photoId; if (it.lotNo) line.lotNo = it.lotNo; if (it.packQty) { line.packQty = it.packQty; line.packs = it.packs; } }
     if (it.prodDate) p.lastProdDate = it.prodDate;
     if (it.useBy) p.lastUseBy = it.useBy;
     setStockOf(p, wh, after); p.updatedAt = Date.now();
@@ -286,6 +306,91 @@
     await DB.applyMovement(movement, touched);
     await loadAll();
     return movement;
+  }
+
+  // ---------- Škody (rozbité / shnilé / prošlé zboží) ----------
+  /* Skladník zapíše poškozené zboží (karton nebo kusy) → odepíše se ze skladu jako doklad S-CZ-2026-0001.
+   * Fotka se ukládá zvlášť (settings `photo:<id>`), aby se při startu appky nestahovaly všechny fotky. */
+  async function savePhoto(dataUrl) {
+    if (!dataUrl) return null;
+    const id = uid(); await DB.put('settings', { key: 'photo:' + id, value: dataUrl }); photoCache[id] = dataUrl; return id;
+  }
+  const photoCache = {};
+  async function loadPhoto(id) {
+    if (!id) return null; if (photoCache[id]) return photoCache[id];
+    try { const r = await DB.get('settings', 'photo:' + id); return (photoCache[id] = r ? r.value : null); } catch (_) { return null; }
+  }
+  /** Fotka z mobilu zmenšená na max. 1024 px (~50–100 kB), aby šla rychle uložit i přes mobilní data. */
+  async function photoToDataUrl(file, max = 1024) {
+    const bmp = await createImageBitmap(file); const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
+    const c = document.createElement('canvas'); c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    return c.toDataURL('image/jpeg', 0.6);
+  }
+  function showPhoto(src, title = 'Fotka') {
+    return dialog(`<div class="modal-head"><strong>📷 ${esc(title)}</strong><button class="iconbtn" data-close>✕</button></div><img class="dmg-photo-big" src="${src}" alt="fotka škody">`);
+  }
+  /** Okno „Zapsat škodu“: důvod, množství (kartony + kusy), šarže, fotka, poznámka.
+   *  lot = šarže daná předem (příjem); jinak se u více šarží ve skladu vybírá. Vrací { qty, reason, note, photo, lot, lotNo, packs, packQty } nebo null. */
+  async function damageDialog(p, { pack = null, g = null, wh = state.wh, lot = null, lotNo = null, title = null, extraHtml = '', atReceipt = false } = {}) {
+    const carton = pack || (p.packs || []).filter(k => Number(k.qty) > 1).sort((a, b) => b.qty - a.qty)[0] || null;
+    const weighed = isWeighed(p);
+    const gq = g ? gs1Qty({ p, pack, gs1: g }) : null;
+    const lots = atReceipt || lot ? [] : lotsOf(p, wh);
+    const preLot = lot || (g && g.useBy && lots.some(l => l.useBy === g.useBy) ? { useBy: g.useBy } : null);
+    let photo = null;
+    return new Promise((resolve) => {
+      dialog(`
+        <div class="modal-head"><strong>⚠️ ${esc(title || 'Škoda: ' + p.name)}</strong><button class="iconbtn" data-close>✕</button></div>
+        <div class="muted mono small" style="margin-bottom:8px">${esc(p.code)} · skladem ${fmtQty(stockOf(p, wh))} ${esc(p.unit)} ${whBadge(wh)}</div>
+        ${extraHtml}
+        <label class="lbl-strong">Co se stalo?</label>
+        <div class="reason-grid">${DAMAGE_REASONS.map(r => `<button type="button" class="reason-btn" data-reason="${r.id}"><span>${r.icon}</span>${esc(r.label)}</button>`).join('')}</div>
+        <input type="hidden" name="reason" value="">
+        ${carton && !weighed ? `
+          <div class="grid2" style="margin-top:12px">
+            <div class="field"><label>Celé kartony (po ${fmtQty(carton.qty)} ${esc(p.unit)})</label><input name="packs" type="number" step="1" min="0" inputmode="numeric" value="${pack ? (g && g.count && g.contentGtin ? g.count : 1) : 0}"></div>
+            <div class="field"><label>Jednotlivé kusy (${esc(p.unit)})</label><input name="loose" type="number" step="any" min="0" inputmode="decimal" value="${pack ? 0 : 1}"></div>
+          </div>
+          <div class="pack-note">Odepíše se celkem <strong id="dmgTotal">0</strong> ${esc(p.unit)}</div>`
+        : `<div class="field" style="margin-top:12px"><label>Množství (${esc(p.unit)})</label><input name="loose" type="number" step="any" min="0" inputmode="decimal" value="${gq || (weighed ? '' : 1)}"></div>`}
+        ${lots.length > 1 ? `<div class="field"><label>Která šarže / trvanlivost je poškozená</label><select name="lot">${lotOptions(p, wh, preLot, p.unit)}</select></div>` : ''}
+        <div class="field"><label>Fotka (volitelné)</label>
+          <div class="row"><label class="btn secondary" style="margin:0">📸 Vyfotit<input type="file" accept="image/*" capture="environment" id="dmgFile" hidden></label><span class="muted small" id="dmgPhotoInfo">bez fotky</span></div>
+          <img id="dmgPrev" class="dmg-photo hidden" alt="náhled fotky"></div>
+        <div class="field"><label>Poznámka (volitelné)</label><input name="note" placeholder="např. spadlo z palety, plíseň, promáčknutý karton…" autocomplete="off"></div>
+        <div class="row" style="justify-content:flex-end"><button type="button" class="btn secondary" data-close>Zrušit</button><button type="button" class="btn danger" id="dmgOk">⚠️ Zapsat do škod</button></div>`, {
+        onOpen(card, close) {
+          const num = (v) => Number(String(v || '').replace(',', '.')) || 0;
+          const total = () => carton && !weighed ? round3(num($('[name=packs]', card).value) * carton.qty + num($('[name=loose]', card).value)) : num($('[name=loose]', card).value);
+          const upd = () => { const t = $('#dmgTotal', card); if (t) t.textContent = fmtQty(total()); };
+          $$('[name=packs],[name=loose]', card).forEach(i => i.oninput = upd); upd();
+          $$('[data-reason]', card).forEach(b => b.onclick = () => { $('[name=reason]', card).value = b.dataset.reason; $$('[data-reason]', card).forEach(x => x.classList.toggle('active', x === b)); });
+          $('#dmgFile', card).onchange = async (e) => {
+            const f = e.target.files && e.target.files[0]; if (!f) return;
+            $('#dmgPhotoInfo', card).textContent = 'zpracovávám…';
+            try { photo = await photoToDataUrl(f); $('#dmgPrev', card).src = photo; $('#dmgPrev', card).classList.remove('hidden'); $('#dmgPhotoInfo', card).textContent = '✓ fotka přidána (lze vyfotit znovu)'; }
+            catch (_) { $('#dmgPhotoInfo', card).textContent = 'fotku se nepodařilo načíst'; }
+          };
+          $('#dmgOk', card).onclick = () => {
+            const v = collect(card);
+            if (!v.reason) { toast('Vyber, co se stalo (rozbité / shnilé / prošlé / jiné)'); return; }
+            const q = total(); if (!(q > 0)) { toast('Zadej množství'); return; }
+            const packs = carton && !weighed ? num(v.packs) : 0;
+            close('ok');
+            resolve({ qty: q, reason: v.reason, note: (v.note || '').trim(), photo, lot: lots.length > 1 ? lotFromVal(v.lot || '') : preLot, lotNo: lotNo || (g && g.lot) || null,
+              packs, packQty: packs ? carton.qty : 0 });
+          };
+        }
+      }).then(r => { if (r !== 'ok') resolve(null); });
+    });
+  }
+  /** Zapíše škodu jako doklad S-… (odpis ze skladu). items: výsledky damageDialog + productId. */
+  async function commitDamage(items, meta = {}) {
+    const lines = [];
+    for (const it of items) lines.push({ productId: it.productId, qty: it.qty, reason: it.reason, note: it.note || '', photoId: it.photoId || (it.photo ? await savePhoto(it.photo) : null), lot: it.lot || null, lotNo: it.lotNo || null, packs: it.packs || 0, packQty: it.packQty || 0 });
+    const reasons = [...new Set(lines.map(l => l.reason))];
+    return commitMovement('damage', lines, { reason: reasons.length === 1 ? reasons[0] : 'mixed', ...meta });
   }
 
   // ---------- Rozpracované doklady (přežijí zavření appky) ----------
@@ -309,6 +414,16 @@
   const gs1Of = (code) => (window.GS1 ? GS1.parse(code) : null);
   /** Krátký popis toho, co etiketa říká (pro hlášky). */
   const gs1Info = (g) => g ? [g.useBy ? 'do ' + fmtDay(g.useBy) : '', g.lot ? 'šarže ' + g.lot : '', g.netKg ? fmtQty(g.netKg) + ' kg' : '', g.count && g.contentGtin ? g.count + ' bal.' : ''].filter(Boolean).join(' · ') : '';
+
+  /** Paletová etiketa jen s SSCC (00): kde už byla přijata (příjemky si SSCC pamatují). */
+  const ssccReceipts = (sscc) => state.movements.filter(m => m.type === 'receipt' && m.items.some(i => (i.ssccs || []).includes(sscc)));
+  function ssccMessage(g, code) {
+    if (!g || !g.sscc) return `Etiketa bez kódu zboží: ${code}`;
+    const m = ssccReceipts(g.sscc)[0];
+    const it = m && m.items.find(i => (i.ssccs || []).includes(g.sscc));
+    return it ? `Paleta SSCC ${g.sscc}: ${it.name} (přijato ${m.docNo}). Číslo palety není kód zboží – naskenuj EAN na kartonu/kusu.`
+      : `Číslo palety SSCC ${g.sscc} – neříká, co je uvnitř. Naskenuj EAN na kartonu/kusu, nebo vyber produkt ze seznamu.`;
+  }
 
   /** Dekodér ZXing-C++ (WebAssembly) – čte i dlouhé GS1-128 kódy z kartonů a palet. Načte se při prvním skenu. */
   const zx = {
@@ -382,7 +497,7 @@
       if (caps.torch) { let on = false; torch.classList.remove('hidden'); torch.onclick = async () => { on = !on; try { await this.track.applyConstraints({ advanced: [{ torch: on }] }); torch.classList.toggle('on', on); } catch (_) {} }; }
       const zoom = $('#camZoom');
       if (caps.zoom && caps.zoom.max > caps.zoom.min) {
-        const steps = [Math.max(1, caps.zoom.min), 2, 3].filter((z, i, a) => z <= caps.zoom.max && a.indexOf(z) === i);
+        const steps = [Math.max(1, caps.zoom.min), 1.5, 2, 3].filter((z, i, a) => z <= caps.zoom.max && a.indexOf(z) === i);
         if (steps.length > 1) { zoom.classList.remove('hidden'); this.zoomIdx = 0; zoom.onclick = async () => { this.zoomIdx = (this.zoomIdx + 1) % steps.length; try { await this.track.applyConstraints({ advanced: [{ zoom: steps[this.zoomIdx] }] }); zoom.textContent = steps[this.zoomIdx] + '×'; } catch (_) {} }; }
       }
     },
@@ -403,9 +518,11 @@
             }
             // ZXing: bez nativní čtečky pokaždé, s ní jen když dlouho nic nenašla (každý 3. snímek).
             if (!texts.length && zxOk && (!this.native || (nativeMisses > 4 && nativeMisses % 3 === 0))) {
-              // Střed obrazu (rámeček): celá šířka, 60 % výšky; max. 1600 px pro rychlost.
-              const vw = v.videoWidth, vh = v.videoHeight;
-              const ch = Math.round(vh * (vw > vh ? 0.8 : 0.6)), cy = Math.round((vh - ch) / 2);
+              // Střed obrazu (rámeček): celá šířka, 60 % výšky; každý 2. pokus celý snímek (široké paletové kódy,
+              // které se do rámečku nevejdou nebo jsou mimo střed). Max. 1600 px pro rychlost.
+              const vw = v.videoWidth, vh = v.videoHeight; this.zxPass = (this.zxPass || 0) + 1;
+              const full = this.zxPass % 2 === 0;
+              const ch = full ? vh : Math.round(vh * (vw > vh ? 0.8 : 0.6)), cy = Math.round((vh - ch) / 2);
               const scale = Math.min(1, 1600 / Math.max(vw, ch));
               canvas.width = Math.round(vw * scale); canvas.height = Math.round(ch * scale);
               ctx.drawImage(v, 0, cy, vw, ch, 0, 0, canvas.width, canvas.height);
@@ -450,9 +567,10 @@
       this.lastCode = code; this.lastSeen = now;
       const g = gs1Of(code);
       if (g && !g.gtin) {
-        // Samotné SSCC (00) – číslo palety, neříká co je uvnitř.
-        const msg = g.sscc ? `Kód palety SSCC ${g.sscc} – naskenuj druhý kód se zbožím (02)/(01)` : `Etiketa bez kódu zboží: ${code}`;
-        if (!$('#scanModal').classList.contains('hidden')) this.feedback(msg, false); else toast(msg, 3500);
+        // Samotné SSCC (00) – číslo palety, neříká co je uvnitř. Příjem ho umí (vybere se produkt ručně), jinde jen hláška.
+        if (g.sscc && this.onCode && this.onCode.sscc) return this.onCode(code);
+        const msg = ssccMessage(g, code);
+        if (!$('#scanModal').classList.contains('hidden')) this.feedback(msg, false); else { beep(false); toast(msg, 5000); }
         return;
       }
       if (this.onCode) this.onCode(code);
@@ -491,7 +609,11 @@
     if (!$('#scanModal').classList.contains('hidden')) return scanner.handle(code);
     if (!$('#errScreen').classList.contains('hidden')) { beep(false); return; }
     const g = gs1Of(code);
-    if (g && !g.gtin) return scanner.handle(code); // jen hláška o SSCC
+    if (g && !g.gtin) { // paleta SSCC: příjem ji zpracuje, jinde jen hláška
+      const dlg = $$('.modal').some(m => m.id !== 'scanModal' && !m.classList.contains('hidden'));
+      if (g.sscc && pageScan && pageScan.sscc && !dlg) return pageScan(code);
+      return scanner.handle(code);
+    }
     const dlgOpen = $$('.modal').some(m => m.id !== 'scanModal' && !m.classList.contains('hidden'));
     if (dlgOpen) { if (dialogScan) dialogScan(code); else { beep(false); toast('Nejdřív dokonči otevřené okno, pak skenuj.'); } return; }
     (pageScan || quickScanHandle)(code);
@@ -751,7 +873,7 @@
     const { path, params } = currentRoute();
     const fn = routes[path] || routes['/'];
     if (path !== lastPath) { lastPath = path; window.scrollTo(0, 0); } // nová obrazovka začíná nahoře
-    document.body.classList.toggle('print-label', path === '/stitek' || path === '/faktura');
+    document.body.classList.toggle('print-label', path === '/stitek' || path === '/faktura' || path === '/dodaci-list');
     $$('[data-route]').forEach(a => a.classList.toggle('active', a.dataset.route === path));
     $('#sidenav').classList.remove('open'); $('#backdrop').classList.remove('open');
     pageScan = null;
@@ -800,6 +922,7 @@
           <a class="btn secondary" href="#/vydej">⬆️ Nový výdej</a>
           <a class="btn secondary" href="#/inventura">📋 Inventura</a>
           <a class="btn secondary" href="#/presun">⇄ Přesun ${wh} → ${otherWh(wh)}</a>
+          <a class="btn secondary" href="#/skody">⚠️ Zapsat škodu</a>
           <button class="btn secondary" id="dashAdd">＋ Produkt</button>
         </div>
       </div>
@@ -892,6 +1015,7 @@
           <button class="btn secondary" id="pEdit">✏️ Upravit</button>
           <button class="btn secondary" id="pAdjust">🔧 Opravit stav ${state.wh}</button>
           <a class="btn secondary" href="#/presun?pid=${p.id}">⇄ Přesun</a>
+          <a class="btn secondary" href="#/skody?pid=${p.id}">⚠️ Škoda</a>
           <a class="btn secondary" href="#/produkty">← Zpět</a>
         </div>
       </div>
@@ -928,20 +1052,65 @@
       // Rozpracovaný doklad je zvlášť pro každý sklad; přesun má jeden s vlastním směrem.
       const key = type === 'transfer' ? 'draft:transfer' : `draft:${type}:${state.wh}`;
       let draft = (await drafts.get(key)) || { items: [], partner: '', note: '', from: state.wh };
+      draft.damages = draft.damages || []; // příjem: poškozené zboží z dodávky → po uložení doklad škody S-…
       if (!WAREHOUSES.some(w => w.id === draft.from)) draft.from = state.wh;
       const whFrom = () => (type === 'transfer' ? draft.from : state.wh);
       const whTo = () => otherWh(whFrom());
       const save = () => drafts.set(key, draft);
 
       /** Přidá řádek do dokladu; stejný produkt se stejnou trvanlivostí a šarží se přičte. */
-      const addRow = async (p, q, pd, ub, ln) => {
+      const addRow = async (p, q, pd, ub, ln, sscc = null) => {
         let row = draft.items.find(i => i.productId === p.id && (i.prodDate || null) === pd && (i.useBy || null) === ub && (i.lotNo || null) === ln);
         if (row) row.qty = round3(Number(row.qty) + q); else { row = { productId: p.id, qty: q, prodDate: pd, useBy: ub, lotNo: ln }; draft.items.unshift(row); }
+        if (sscc) row.ssccs = [...(row.ssccs || []), sscc];
         await save(); draw();
         return row;
       };
+      /** Paletová etiketa jen s číslem palety SSCC (např. Entremont): zboží v kódu není → produkt vybrat, množství a šarži opsat.
+       *  SSCC se uloží k řádku příjmu, takže druhý štítek téže palety se nezapočítá dvakrát. */
+      const addSscc = async (sscc) => {
+        const say = (msg, ok) => { if (!$('#scanModal').classList.contains('hidden')) scanner.feedback(msg, ok); else { beep(ok); toast(msg, 4500); } };
+        const dup = draft.items.find(i => (i.ssccs || []).includes(sscc));
+        if (dup) { const dp = productById(dup.productId); say(`Tahle paleta už v příjmu je${dp ? ' (' + dp.name + ')' : ''} – druhý štítek téže palety se nepočítá.`, false); return; }
+        if (!$('#scanModal').classList.contains('hidden')) { say(`📦 Paleta SSCC ${sscc} – vyber zboží`, true); await scanner.pause(); }
+        const prev = ssccReceipts(sscc)[0];
+        const prevIt = prev && prev.items.find(i => (i.ssccs || []).includes(sscc));
+        // Nabídka: zboží, které už přišlo na paletách od stejného dodavatele (stejný začátek SSCC).
+        const pref = sscc.slice(1, 8); const recent = [];
+        for (const m of state.movements) {
+          if (m.type !== 'receipt') continue;
+          for (const i of m.items) if ((i.ssccs || []).some(x => x.slice(1, 8) === pref) && !recent.includes(i.productId) && productById(i.productId)) recent.push(i.productId);
+          if (recent.length >= 4) break;
+        }
+        const choice = await dialog(`
+          <div class="modal-head"><strong>📦 Paletová etiketa</strong><button class="iconbtn" data-close>✕</button></div>
+          <p style="margin-top:0">Načteno <span class="mono">(00) ${esc(sscc)}</span> – to je <strong>číslo palety (SSCC)</strong>, ne kód zboží. Vyber produkt podle textu na etiketě a v dalším kroku opiš množství (Qte) a šarži (Lot).</p>
+          ${prevIt ? `<div class="pack-note" style="border-color:#e0a800">⚠️ Tahle paleta už byla přijata: ${esc(prev.docNo)} · ${fmtDate(prev.ts)} · ${esc(prevIt.name)} ${fmtQty(prevIt.qty)} ${esc(prevIt.unit || '')}. Přijmi ji znovu jen pokud jde opravdu o nové zboží.</div>` : ''}
+          <div class="list">
+            ${recent.map(id => { const p = productById(id); return `<button type="button" class="btn secondary big" data-rp="${esc(id)}">↺ ${esc(p.name)}</button>`; }).join('')}
+            <button type="button" class="btn big" id="ssPick">📋 Vybrat produkt</button>
+            <button type="button" class="btn secondary" data-close>Zrušit</button>
+          </div>`, { onOpen(card, close) { $('#ssPick', card).onclick = () => close('pick'); $$('[data-rp]', card).forEach(b => b.onclick = () => close('id:' + b.dataset.rp)); } });
+        let p = null;
+        if (choice === 'pick') p = await pickProduct();
+        else if (typeof choice === 'string' && choice.startsWith('id:')) p = productById(choice.slice(3));
+        if (p) {
+          const pack = (p.packs || []).find(k => Number(k.qty) > 1) || null;
+          const last = draft.items.find(i => i.productId === p.id);
+          const r = await qtyDialog(p, { title: `Příjem palety: ${p.name}`, defaultQty: '', pack, packsDefault: '', dates: true,
+            prodDate: last ? last.prodDate || '' : '', useBy: last ? last.useBy || '' : '', lotNo: last ? last.lotNo || '' : '',
+            extraHtml: `<p class="pack-note">🏷️ Paleta <span class="mono">${esc(sscc)}</span> – opiš z etikety počet (např. „Qte 22U“)${pack ? ' – stačí počet kartonů' : ''}, šarži (Lot) a trvanlivost.</p>` });
+          if (r && r.qty > 0) {
+            const row = await addRow(p, r.qty, r.prodDate || null, r.useBy || null, r.lotNo || null, sscc);
+            say(`✓ ${p.name}: +${fmtQty(r.qty)} ${p.unit} (paleta) · celkem ${fmtQty(row.qty)} ${p.unit}`, true);
+          }
+        }
+        if (scanner.running) await scanner.resume();
+      };
       const addCode = async (code) => {
         const scanning = !$('#scanModal').classList.contains('hidden');
+        const g0 = gs1Of(code);
+        if (g0 && !g0.gtin && g0.sscc) { if (type === 'receipt') return addSscc(g0.sscc); return scanner.handle(code); }
         let hit = lookupCode(code);
         if (!hit) {
           if (scanning) { scanner.feedback(`Neznámý kód ${code}`, false); await scanner.close(); }
@@ -987,7 +1156,7 @@
           const p = productById(it.productId); if (!p) return '';
           const have = stockOf(p, whFrom()); const warn = type !== 'receipt' && have < it.qty;
           return `<div class="item">
-            <div class="grow"><div class="name">${esc(p.name)}</div><div class="code mono">${esc(p.code)} · skladem ${fmtQty(have)} ${esc(p.unit)} (${esc(whFrom())})${warn ? ' <span class="badge danger">nedostatek</span>' : ''}${it.useBy ? ' · spotřeba do ' + fmtDay(it.useBy) : ''}${it.prodDate ? ' · výroba ' + fmtDay(it.prodDate) : ''}${it.lotNo ? ' · šarže ' + esc(it.lotNo) : ''}</div></div>
+            <div class="grow"><div class="name">${esc(p.name)}</div><div class="code mono">${esc(p.code)} · skladem ${fmtQty(have)} ${esc(p.unit)} (${esc(whFrom())})${warn ? ' <span class="badge danger">nedostatek</span>' : ''}${it.useBy ? ' · spotřeba do ' + fmtDay(it.useBy) : ''}${it.prodDate ? ' · výroba ' + fmtDay(it.prodDate) : ''}${it.lotNo ? ' · šarže ' + esc(it.lotNo) : ''}${it.ssccs && it.ssccs.length ? ` · 📦 ${it.ssccs.length === 1 ? 'paleta' : it.ssccs.length + ' palety'}` : ''}</div></div>
             <div class="qty-ctl"><button data-dec="${idx}">−</button><input type="number" step="any" min="0" data-qty="${idx}" value="${it.qty}"><button data-inc="${idx}">+</button></div>
             <button class="iconbtn" data-del="${idx}" title="Odebrat">🗑</button>
           </div>`;
@@ -998,9 +1167,16 @@
         $$('[data-inc]', el).forEach(b => b.onclick = async () => { draft.items[b.dataset.inc].qty = Number(draft.items[b.dataset.inc].qty) + 1; await save(); draw(); });
         $$('[data-dec]', el).forEach(b => b.onclick = async () => { const it = draft.items[b.dataset.dec]; it.qty = Math.max(0, Number(it.qty) - 1); if (it.qty === 0) draft.items.splice(b.dataset.dec, 1); await save(); draw(); });
         $$('[data-del]', el).forEach(b => b.onclick = async () => { draft.items.splice(b.dataset.del, 1); await save(); draw(); });
+        const dd = $('#docDamages', el);
+        if (dd) {
+          dd.innerHTML = draft.damages.length ? `<div class="card dmg-box"><h2>⚠️ Poškozené z dodávky</h2><p class="muted small" style="margin-top:0">Po uložení příjmu se tohle odepíše ze skladu jako škoda (samostatný doklad S-…).</p>
+            <div class="list">${draft.damages.map((d, idx) => { const p = productById(d.productId); return p ? `<div class="item"><div class="grow"><div class="name">${esc(p.name)} <span class="dmg-qty">−${fmtQty(d.qty)} ${esc(p.unit)}</span></div><div class="small">${reasonBadge(d.reason)}${d.lot && d.lot.useBy ? ' · šarže do ' + fmtDay(d.lot.useBy) : ''}${d.photo ? ' · 📷' : ''}${d.note ? ' · ' + esc(d.note) : ''}</div></div><button class="iconbtn" data-ddel="${idx}" title="Odebrat">🗑</button></div>` : ''; }).join('')}</div></div>` : '';
+          $$('[data-ddel]', dd).forEach(b => b.onclick = async () => { draft.damages.splice(b.dataset.ddel, 1); await save(); draw(); });
+        }
       };
 
       el.innerHTML = `
+        ${type === 'receipt' ? inboundWaitingHtml() : ''}
         <div class="card">
           ${type === 'transfer'
             ? `<div class="row between" style="margin-bottom:10px"><div class="transfer-dir"><span class="muted small">Z</span> <strong id="docFrom"></strong> <span class="muted">→</span> <span class="muted small">do</span> <strong id="docTo"></strong></div><button class="btn sm secondary" id="docSwap">⇄ Otočit směr</button></div>`
@@ -1009,26 +1185,64 @@
             <button class="btn big grow" id="docScan">📷 ${labels.scan}</button>
             <button class="btn secondary" id="docPick" title="Vybrat ze seznamu" style="min-height:52px">📋</button>
           </div>
+          ${type === 'receipt' ? '<button class="btn secondary dmg-btn" id="docDamage">⚠️ Zapsat poškozené / zkažené z této dodávky</button>' : ''}
           <div class="grid2" style="margin-top:12px">
             ${labels.partner ? `<div class="field"><label>${labels.partner}</label><input id="docPartner" value="${esc(draft.partner || '')}" placeholder="volitelné"></div>` : ''}
             <div class="field"><label>${type === 'transfer' ? 'Poznámka / důvod přesunu' : 'Poznámka / číslo dodacího listu'}</label><input id="docNote" value="${esc(draft.note || '')}" placeholder="volitelné"></div>
           </div>
         </div>
         <div class="list" id="docItems"></div>
+        <div id="docDamages"></div>
         <div class="sticky-actions">
           <div class="row between" style="margin-bottom:6px"><span class="muted small" id="docSummary"></span><button class="btn sm secondary" id="docClear">Zahodit</button></div>
           <button class="btn big ok" id="docCommit">✅ ${labels.verb} a uložit doklad</button>
         </div>`;
       drawDir(); draw();
+      $$('[data-count]', el).forEach(d => d.onclick = () => location.hash = `#/pocitat?id=${d.dataset.count}`);
 
       const partner = $('#docPartner'); if (partner) partner.oninput = async (e) => { draft.partner = e.target.value; await save(); };
       $('#docNote').oninput = async (e) => { draft.note = e.target.value; await save(); };
       const whLink = $('#docWh'); if (whLink) whLink.onclick = (e) => { e.preventDefault(); $('#whBtn').click(); };
       const swap = $('#docSwap'); if (swap) swap.onclick = async () => { draft.from = whTo(); await save(); drawDir(); draw(); toast(`Přesun ${whFrom()} → ${whTo()}`); };
+      addCode.sscc = type === 'receipt'; // příjem umí i paletovou etiketu jen s SSCC
       $('#docScan').onclick = () => scanner.open(labels.scan, addCode);
       pageScan = addCode;
       $('#docPick').onclick = async () => { const p = await pickProduct(); if (p) { await addCode(p.code); } };
-      $('#docClear').onclick = async () => { if (draft.items.length && !await confirmDlg('Zahodit doklad', 'Rozpracovaný doklad bude smazán.', 'Zahodit', true)) return; draft = { items: [], partner: '', note: '', from: draft.from }; await drafts.clear(key); draw(); };
+      /** Příjem: poškozené zboží z dodávky. Řádek příjmu (produkt + šarže) jde vybrat ťuknutím, jinak sken / seznam. */
+      const addDamage = async (p, { pack = null, g = null, row = null } = {}) => {
+        const rows = draft.items.filter(i => i.productId === p.id);
+        const r0 = row || (g && g.useBy ? rows.find(i => i.useBy === g.useBy) : null) || rows[0] || null;
+        const res = await damageDialog(p, { pack, g, wh: whFrom(), atReceipt: true, lot: r0 ? { useBy: r0.useBy || null } : null, lotNo: r0 ? r0.lotNo || null : null,
+          title: `Poškozené: ${p.name}`, extraHtml: r0 ? `<p class="pack-note">Z dodávky: ${fmtQty(r0.qty)} ${esc(p.unit)}${r0.useBy ? ' · do ' + fmtDay(r0.useBy) : ''}${r0.lotNo ? ' · šarže ' + esc(r0.lotNo) : ''}</p>` : '<p class="pack-note" style="border-color:#e0a800">Tohle zboží zatím v příjmu není. Přijmi nejdřív celé množství (i s poškozenými kusy), poškozené se pak odepíšou zvlášť.</p>' });
+        if (!res) return false;
+        draft.damages.push({ productId: p.id, ...res }); await save(); draw();
+        toast(`⚠️ ${p.name}: −${fmtQty(res.qty)} ${p.unit} do škod (zapíše se při uložení příjmu)`, 3500);
+        return true;
+      };
+      const damageCode = async (code) => {
+        const scanning = !$('#scanModal').classList.contains('hidden');
+        const hit = lookupCode(code);
+        if (!hit) { scanner.feedback(`Neznámý kód ${code} – nejdřív ho přijmi`, false); return; }
+        if (scanning) { scanner.feedback(`✓ ${hit.p.name}`, true); await scanner.close(); }
+        await addDamage(hit.p, { pack: hit.pack, g: hit.gs1 || null });
+      };
+      const dmgBtn = $('#docDamage');
+      if (dmgBtn) dmgBtn.onclick = async () => {
+        const choice = await dialog(`
+          <div class="modal-head"><strong>⚠️ Poškozené z dodávky</strong><button class="iconbtn" data-close>✕</button></div>
+          <p class="muted small" style="margin-top:0">Co je poškozené? Ťukni na zboží z příjmu, nebo naskenuj rozbitý karton / kus.</p>
+          <div class="list">
+            ${draft.items.map((i, idx) => { const p = productById(i.productId); return p ? `<button type="button" class="btn secondary big" data-dr="${idx}" style="text-align:left">${esc(p.name)} <span class="muted small">· ${fmtQty(i.qty)} ${esc(p.unit)}${i.useBy ? ' · do ' + fmtDay(i.useBy) : ''}</span></button>` : ''; }).join('')}
+            <button type="button" class="btn big danger" id="drScan">📷 Naskenovat poškozené</button>
+            <button type="button" class="btn secondary" id="drPick">📋 Vybrat ze seznamu</button>
+          </div>`, { onOpen(card, close) { $('#drScan', card).onclick = () => close('scan'); $('#drPick', card).onclick = () => close('pick'); $$('[data-dr]', card).forEach(b => b.onclick = () => close('row:' + b.dataset.dr)); } });
+        if (!choice) return;
+        if (choice === 'scan') return scanner.open('Skenuj poškozené zboží', damageCode);
+        if (choice === 'pick') { const p = await pickProduct(); if (p) await addDamage(p); return; }
+        const row = draft.items[Number(String(choice).slice(4))]; const p = row && productById(row.productId);
+        if (p) await addDamage(p, { row });
+      };
+      $('#docClear').onclick = async () => { if (draft.items.length && !await confirmDlg('Zahodit doklad', 'Rozpracovaný doklad bude smazán.', 'Zahodit', true)) return; draft = { items: [], damages: [], partner: '', note: '', from: draft.from }; await drafts.clear(key); draw(); };
       $('#docCommit').onclick = async () => {
         if (!draft.items.length) return;
         if (type !== 'receipt') {
@@ -1036,8 +1250,14 @@
           if (short.length && !await confirmDlg('Nedostatek zásob', `${short.length} položek by ve skladu ${whName(whFrom())} šlo do mínusu. Přesto ${type === 'transfer' ? 'přesunout' : 'vydat'}?`, labels.verb)) return;
         }
         const m = await commitMovement(type, draft.items, { partner: (draft.partner || '').trim(), note: (draft.note || '').trim(), wh: whFrom(), whTo: type === 'transfer' ? whTo() : null });
+        let dm = null;
+        if (type === 'receipt' && draft.damages.length) {
+          // Nejdřív se přijme celá dodávka, pak se poškozené odepíše jako škoda s odkazem na příjemku (podklad k reklamaci u dodavatele).
+          try { dm = await commitDamage(draft.damages, { wh: whFrom(), partner: (draft.partner || '').trim(), note: `Poškozeno při příjmu ${m.docNo}`, receiptId: m.id, receiptDocNo: m.docNo }); }
+          catch (err) { toast('Příjem uložen, ale škodu se nepodařilo zapsat: ' + err.message, 6000); }
+        }
         await drafts.clear(key);
-        toast(`${labels.title} ${m.docNo} uložen`);
+        toast(`${labels.title} ${m.docNo} uložen${dm ? ` · škoda ${dm.docNo}` : ''}`, dm ? 4000 : 2200);
         showMovement(m.id); location.hash = '#/historie';
       };
 
@@ -1049,6 +1269,97 @@
   routes['/prijem'] = docView('receipt');
   routes['/vydej'] = docView('issue');
   routes['/presun'] = docView('transfer');
+
+  // ---------- Škody: mobil zapisuje, kancl na PC vidí přehled ----------
+  let dmgFilter = { period: 'month', wh: 'all', reason: 'all' };
+  /** Řádky škod (jeden řádek = jeden produkt v dokladu S-…), nejnovější nahoře. */
+  const damageRows = () => state.movements.filter(m => m.type === 'damage').flatMap(m => m.items.map(i => ({ m, i })));
+  const periodRange = (k) => {
+    const d = new Date(); const y = d.getFullYear(), mo = d.getMonth();
+    if (k === 'month') return [new Date(y, mo, 1).getTime(), Infinity];
+    if (k === 'prev') return [new Date(y, mo - 1, 1).getTime(), new Date(y, mo, 1).getTime()];
+    if (k === 'year') return [new Date(y, 0, 1).getTime(), Infinity];
+    return [0, Infinity];
+  };
+  const PERIODS = [['month', 'Tento měsíc'], ['prev', 'Minulý měsíc'], ['year', 'Letos'], ['all', 'Vše']];
+  /** Hodnota škody bez DPH podle ceny z karty produktu (v měně skladu); null když produkt nemá cenu. */
+  const damageValue = (m, i) => { const pr = priceOf(productById(i.productId), m.wh); return pr == null ? null : round2(pr * Math.abs(i.diff)); };
+
+  routes['/skody'] = async (el, params) => {
+    setTitle('Škody');
+    const wh = state.wh;
+    const [from, to] = periodRange(dmgFilter.period);
+    const rows = damageRows().filter(({ m, i }) => m.ts >= from && m.ts < to && (dmgFilter.wh === 'all' || m.wh === dmgFilter.wh) && (dmgFilter.reason === 'all' || i.reason === dmgFilter.reason));
+    const byWh = WAREHOUSES.map(w => { const rs = rows.filter(r => r.m.wh === w.id); const vals = rs.map(r => damageValue(r.m, r.i)); return { w, n: rs.length, value: vals.reduce((s, v) => s + (v || 0), 0), noPrice: vals.filter(v => v == null).length }; }).filter(x => x.n);
+    const byReason = DAMAGE_REASONS.map(r => ({ r, n: rows.filter(x => x.i.reason === r.id).length })).filter(x => x.n);
+
+    el.innerHTML = `
+      <div class="card dmg-entry">
+        <div class="muted small" style="margin-bottom:10px">Zápis škody do skladu: <strong>${whInfo(wh).flag} ${esc(whName(wh))}</strong> · <a href="#" id="dmgWh">přepnout sklad</a></div>
+        <div class="row">
+          <button class="btn big danger grow" id="dmgScan">📷 Naskenovat poškozené zboží</button>
+          <button class="btn secondary" id="dmgPick" title="Vybrat ze seznamu" style="min-height:52px">📋</button>
+        </div>
+        <p class="muted small" style="margin-bottom:0">Naskenuj rozbitý karton nebo kus, vyber co se stalo (rozbité, shnilé, prošlé…) a kolik. Zboží se hned odepíše ze skladu jako škoda (doklad S-${esc(wh)}-…). Poškozené zboží z právě přijaté palety zapíšeš rovnou v Příjmu.</p>
+      </div>
+      <div class="row between" style="margin:4px 0 8px"><h2 style="margin:0">Přehled škod</h2><button class="btn sm secondary" id="dmgCsv" ${rows.length ? '' : 'disabled'}>⬇ CSV</button></div>
+      <div class="chips">${PERIODS.map(([k, l]) => `<span class="chip ${dmgFilter.period === k ? 'active' : ''}" data-per="${k}">${l}</span>`).join('')}
+        <span class="grow"></span>${[['all', 'Oba sklady'], ...WAREHOUSES.map(w => [w.id, `${w.flag} ${w.id}`])].map(([k, l]) => `<span class="chip ${dmgFilter.wh === k ? 'active' : ''}" data-dwh="${k}">${l}</span>`).join('')}</div>
+      <div class="chips">${[['all', 'Všechny důvody'], ...DAMAGE_REASONS.map(r => [r.id, `${r.icon} ${r.label}`])].map(([k, l]) => `<span class="chip ${dmgFilter.reason === k ? 'active' : ''}" data-rsn="${k}">${esc(l)}</span>`).join('')}</div>
+      <div class="stats">
+        <div class="stat ${rows.length ? 'danger' : ''}"><div class="num">${rows.length}</div><div class="lbl">záznamů škod</div></div>
+        ${byWh.map(x => `<div class="stat"><div class="num">${fmtMoney(x.value, x.w.id)}</div><div class="lbl">${x.w.flag} hodnota škod bez DPH${x.noPrice ? ` · ${x.noPrice}× bez ceny` : ''}</div></div>`).join('')}
+        ${byReason.map(x => `<div class="stat"><div class="num">${x.n}</div><div class="lbl">${x.r.icon} ${esc(x.r.label)}</div></div>`).join('')}
+      </div>
+      ${rows.length ? `<div class="list">${rows.map(({ m, i }) => { const v = damageValue(m, i); return `
+        <div class="item clickable dmg-row" data-mid="${m.id}">
+          <div class="grow">
+            <div class="name">${esc(i.name)} <span class="dmg-qty">−${fmtQty(Math.abs(i.diff))} ${esc(i.unit || '')}</span>${i.packs && i.packQty ? ` <span class="muted small">(${fmtQty(i.packs)} krt)</span>` : ''}</div>
+            <div class="small">${reasonBadge(i.reason)} ${whBadge(m.wh)} ${m.receiptDocNo ? `<span class="badge neutral">při příjmu ${esc(m.receiptDocNo)}</span>` : ''} ${i.photoId ? '<span title="má fotku">📷</span>' : ''}</div>
+            <div class="code small muted">${fmtDate(m.ts)} · <span class="mono">${esc(m.docNo)}</span>${(i.batches || []).some(b => b.useBy) ? ' · šarže do ' + [...new Set(i.batches.filter(b => b.useBy).map(b => fmtDay(b.useBy)))].join(', ') : ''}${i.lotNo ? ' · LOT ' + esc(i.lotNo) : ''}${m.by ? ' · ' + esc(m.by) : ''}</div>
+            ${i.note ? `<div class="small">📝 ${esc(i.note)}</div>` : ''}
+          </div>
+          ${v != null ? `<div class="num small muted" style="white-space:nowrap">${fmtMoney(v, m.wh)}</div>` : ''}
+        </div>`; }).join('')}</div>`
+      : `<div class="empty"><div class="big">✅</div>V tomto období žádné škody.</div>`}`;
+
+    /** Naskenovaný / vybraný produkt → okno škody → hned odepsat. */
+    const addCode = async (code) => {
+      const scanning = !$('#scanModal').classList.contains('hidden');
+      let hit = lookupCode(code);
+      if (!hit) {
+        if (scanning) { scanner.feedback(`Neznámý kód ${code}`, false); await scanner.close(); }
+        hit = await resolveUnknownCode(code);
+        if (!hit) return;
+      }
+      const { p, pack } = hit; const g = hit.gs1 || null;
+      if (scanning) { scanner.feedback(`✓ ${p.name}${pack ? ' · ' + packLabel(p, pack) : ''}`, true); await scanner.pause(); }
+      const r = await damageDialog(p, { pack, g, wh });
+      if (r) {
+        if (r.qty > stockOf(p, wh) && !await confirmDlg('Víc než je skladem', `Ve skladu ${whName(wh)} je jen ${fmtQty(stockOf(p, wh))} ${p.unit}. Přesto zapsat škodu ${fmtQty(r.qty)} ${p.unit}? Stav půjde do mínusu.`, 'Zapsat')) { if (scanner.running) await scanner.resume(); return; }
+        const m = await commitDamage([{ productId: p.id, ...r }], { wh, note: r.note });
+        const msg = `⚠️ ${m.docNo}: ${p.name} −${fmtQty(r.qty)} ${p.unit} odepsáno jako škoda`;
+        if (scanning && scanner.running) { scanner.feedback(msg, true); await scanner.resume(); } else toast(msg, 3500);
+        render();
+        return;
+      }
+      if (scanner.running) await scanner.resume();
+    };
+    pageScan = addCode;
+    $('#dmgScan').onclick = () => scanner.open('Skenuj poškozené zboží', addCode);
+    $('#dmgPick').onclick = async () => { const p = await pickProduct(); if (p) await addCode(p.code); };
+    $('#dmgWh').onclick = (e) => { e.preventDefault(); $('#whBtn').click(); };
+    $$('[data-per]', el).forEach(c => c.onclick = () => { dmgFilter.period = c.dataset.per; render(); });
+    $$('[data-dwh]', el).forEach(c => c.onclick = () => { dmgFilter.wh = c.dataset.dwh; render(); });
+    $$('[data-rsn]', el).forEach(c => c.onclick = () => { dmgFilter.reason = c.dataset.rsn; render(); });
+    $$('[data-mid]', el).forEach(d => d.onclick = () => showMovement(d.dataset.mid));
+    $('#dmgCsv').onclick = () => downloadText(`skody-${new Date().toISOString().slice(0, 10)}.csv`, toCsv([['Doklad', 'Datum', 'Sklad', 'Kód', 'Produkt', 'Množství', 'Jednotka', 'Kartonů', 'Důvod', 'Trvanlivost šarže', 'LOT', 'Poznámka', 'Při příjmu', 'Dodavatel', 'Hodnota bez DPH', 'Měna', 'Zapsal'],
+      ...rows.map(({ m, i }) => [m.docNo, fmtDate(m.ts), m.wh, i.code, i.name, Math.abs(i.diff), i.unit || '', i.packs || '', reasonInfo(i.reason).label, [...new Set((i.batches || []).filter(b => b.useBy).map(b => fmtDay(b.useBy)))].join(', '), i.lotNo || '', i.note || '', m.receiptDocNo || '', m.partner || '', damageValue(m, i) ?? '', curOf(m.wh), m.by || ''])]), 'text/csv');
+
+    // Z karty produktu: „⚠️ Škoda“ rovnou otevře okno.
+    const pid = params && params.get('pid'); const pre = pid && productById(pid);
+    if (pre) { history.replaceState(null, '', '#/skody'); await addCode(pre.code); }
+  };
 
   async function pickProduct() {
     return new Promise((resolve) => {
@@ -1493,10 +1804,10 @@
           <div><h2>${esc(o.no)} ${whBadge(o.wh)}</h2><div class="muted">${esc(o.customer || 'bez odběratele')}${o.custIco ? ' · IČO ' + esc(o.custIco) : ''} · ${fmtDate(o.ts)}${o.createdBy ? ' · zadal ' + esc(o.createdBy) : ''}</div>${o.note ? `<div style="margin-top:6px">📝 ${esc(o.note)}</div>` : ''}</div>
           <span class="badge status-${o.status}" style="font-size:14px">${ORDER_STATUS[o.status]}</span>
         </div>
-        ${o.status === 'ready' || o.status === 'done' ? `<div class="muted small" style="margin-top:8px">Připravil ${esc(o.preparedBy || '—')} ${o.preparedAt ? fmtDate(o.preparedAt) : ''}${o.movementId ? ' · výdejka <a href="#" id="ordMv">zobrazit</a>' : ''}${o.invoiceNo ? ' · faktura ' + esc(o.invoiceNo) : ''}</div>` : ''}
+        ${o.status === 'ready' || o.status === 'done' ? `<div class="muted small" style="margin-top:8px">Připravil ${esc(o.preparedBy || '—')} ${o.preparedAt ? fmtDate(o.preparedAt) : ''}${o.movementId ? ' · výdejka <a href="#" id="ordMv">zobrazit</a>' : ''}${o.deliveryNo ? ' · dodací list ' + esc(o.deliveryNo) : ''}${o.invoiceNo ? ' · faktura ' + esc(o.invoiceNo) : ''}</div>` : ''}
       </div>
       ${editable && o.wh !== state.wh ? `<div class="card" style="border-color:var(--primary)">ℹ️ Objednávka je ze skladu <strong>${whInfo(o.wh).flag} ${esc(whName(o.wh))}</strong>. Vydané zboží se odepíše z tohoto skladu, i když máš v zařízení vybraný ${esc(whName(state.wh))}.</div>` : ''}
-      ${o.status === 'ready' || o.status === 'done' ? `<div class="card label-card"><div class="row between"><h2>🏷️ Štítek a faktura</h2><div class="row"><a class="btn" href="#/stitek?id=${o.id}">🖨 Štítek na paletu</a><a class="btn secondary" href="#/faktura?id=${o.id}">🧾 Faktura</a></div></div><svg id="ordBarcode"></svg><p class="muted small" style="margin:6px 0 0">Naskenováním štítku (📷 nahoře) se objednávka otevře v mobilu. Fakturu vytiskneš z počítače.</p></div>` : ''}
+      ${o.status === 'ready' || o.status === 'done' ? `<div class="card label-card"><div class="row between"><h2>🏷️ Štítek, dodací list a faktura</h2><div class="row"><a class="btn" href="#/stitek?id=${o.id}">🖨 Štítek na paletu</a><a class="btn secondary" href="#/dodaci-list?id=${o.id}">📄 Dodací list</a><a class="btn secondary" href="#/faktura?id=${o.id}">🧾 Faktura</a></div></div><svg id="ordBarcode"></svg><p class="muted small" style="margin:6px 0 0">Naskenováním štítku (📷 nahoře) se objednávka otevře v mobilu. Dodací list a fakturu vytiskneš z počítače.</p></div>` : ''}
       ${editable ? `<p class="muted small" style="margin:0 0 10px">Ťukni na položku, naskenuj její čárový kód a potvrď množství. Vydané zboží se hned odepíše ze skladu.</p>` : ''}
       ${unmatched.length && editable ? `<div class="card" style="border-color:var(--danger)"><strong>⚠️ ${unmatched.length} položek není přiřazeno k produktu</strong><div class="muted small">Přiřaď je přes Upravit → 🔗, jinak je nejde vydat.</div></div>` : ''}
       ${short.length && editable ? `<div class="card" style="border-color:var(--warn)"><strong>⚠️ Nedostatek na skladě:</strong> ${short.map(i => esc(i.name)).join(', ')}</div>` : ''}
@@ -1535,13 +1846,13 @@
       if (!picked.length) { toast('Nejdřív naskenuj a vydej položky'); return; }
       if (notPicked.length && !await confirmDlg('Ukončit objednávku', `${notPicked.length} položek není vychystaných (${notPicked.map(i => i.name).join(', ')}). Nebudou odepsány ze skladu. Ukončit i tak?`, 'Ukončit')) return;
       o.status = 'ready'; o.preparedBy = state.user; o.preparedAt = Date.now();
-      await assignInvoiceNo(o);
-      await saveOrder(o); toast(`${o.no} připraveno – štítek i faktura jsou k tisku`); render();
+      await assignDeliveryNo(o); await assignInvoiceNo(o);
+      await saveOrder(o); toast(`${o.no} připraveno – štítek, dodací list i faktura jsou k tisku`); render();
     };
     const dn = $('#ordDone', el); if (dn) dn.onclick = async () => { o.status = 'done'; o.doneAt = Date.now(); await saveOrder(o); render(); };
     const cp = $('#ordCopy', el); if (cp) cp.onclick = async () => {
       const items = o.items.map(i => { const c = { ...i, id: uid(), picked: null, pickedAt: null, pickedBy: null, weights: null, manual: false, pickedLots: null }; delete c.lot; return c; });
-      const n = await orderForm({ ...o, id: uid(), no: '', ts: Date.now(), status: 'new', items, preparedBy: null, preparedAt: null, movementId: null, doneAt: null, invoiceNo: null, invoiceAt: null, createdBy: state.user });
+      const n = await orderForm({ ...o, id: uid(), no: '', ts: Date.now(), status: 'new', items, preparedBy: null, preparedAt: null, movementId: null, doneAt: null, deliveryNo: null, deliveryAt: null, invoiceNo: null, invoiceAt: null, createdBy: state.user });
       if (n) location.hash = `#/objednavka?id=${n.id}`;
     };
   };
@@ -1614,14 +1925,20 @@
     const totalNet = round2(Object.values(byVat).reduce((s, x) => s + x.net, 0)), totalVat = round2(Object.values(byVat).reduce((s, x) => s + x.vatAmt, 0));
     const missing = lines.filter(l => l.price == null);
     const money = (n) => fmtMoney(n, wh);
+    const total = round2(totalNet + totalVat);
+    // QR platba: CZ sklad → QR Platba (SPD), SK sklad → PAY by square. Při chybějících cenách by částka nebyla správná → QR se nevytvoří.
+    const iban = PayQR.resolveIban(cfg, wh);
+    const qr = missing.length ? { error: 'QR platba se nevytvořila, protože některé položky nemají cenu.' }
+      : PayQR.build({ wh, iban, bic: cfg.bic, amount: total, currency: cur, vs, due, msg: `Faktura ${o.invoiceNo || o.no}`, name: cfg.name, invoiceId: o.invoiceNo || o.no });
     el.innerHTML = `
+      ${qr.error ? `<div class="card no-print" style="border-color:var(--warn)">⚠️ ${esc(qr.error)}</div>` : ''}
       ${!cfg.name ? `<div class="card no-print" style="border-color:var(--warn)">⚠️ Chybí údaje dodavatele (název, adresa, IČO…). Doplň je v <a href="#/nastaveni">Nastavení → Fakturace</a> pro ${esc(whName(wh))}.</div>` : ''}
       ${missing.length ? `<div class="card no-print" style="border-color:var(--warn)">⚠️ Bez ceny v ${esc(cur)}: ${missing.map(l => esc(l.name)).join(', ')}. Cenu bez DPH doplň v kartě produktu a fakturu znovu otevři.</div>` : ''}
       ${o.status !== 'ready' && o.status !== 'done' ? '<div class="card no-print" style="border-color:var(--warn)">⚠️ Objednávka ještě není připravená – toto je jen náhled, faktura dostane číslo při „Ukončeno – připraveno“.</div>' : ''}
       <div class="invoice">
         <div class="inv-head">
           <div><div class="inv-title">FAKTURA</div><div class="inv-no">${esc(o.invoiceNo || 'náhled')}</div><div class="small">${whInfo(wh).flag} ${esc(whName(wh))} · objednávka ${esc(o.no)}</div></div>
-          <table class="inv-meta"><tr><td>Datum vystavení</td><td>${fmtDay(issue)}</td></tr><tr><td>Datum plnění</td><td>${fmtDay(issue)}</td></tr><tr><td>Datum splatnosti</td><td><strong>${fmtDay(due)}</strong></td></tr><tr><td>Variabilní symbol</td><td>${esc(vs)}</td></tr>${cfg.bank ? `<tr><td>Účet / IBAN</td><td>${esc(cfg.bank)}</td></tr>` : ''}</table>
+          <table class="inv-meta"><tr><td>Datum vystavení</td><td>${fmtDay(issue)}</td></tr><tr><td>Datum plnění</td><td>${fmtDay(issue)}</td></tr><tr><td>Datum splatnosti</td><td><strong>${fmtDay(due)}</strong></td></tr><tr><td>Variabilní symbol</td><td>${esc(vs)}</td></tr>${cfg.bank ? `<tr><td>Účet</td><td>${esc(cfg.bank)}</td></tr>` : ''}</table>
         </div>
         <div class="inv-parties">
           <div class="inv-party"><div class="inv-lbl">Dodavatel</div><strong>${esc(cfg.name || '—')}</strong><div>${esc(cfg.address || '').replace(/\n/g, '<br>')}</div>${cfg.ico ? `<div>IČO: ${esc(cfg.ico)}</div>` : ''}${cfg.dic ? `<div>DIČ / IČ DPH: ${esc(cfg.dic)}</div>` : ''}</div>
@@ -1635,9 +1952,14 @@
           <table>
             ${Object.values(byVat).sort((a, b) => a.vat - b.vat).map(x => `<tr><td>Základ DPH ${fmtQty(x.vat)} %</td><td class="num">${money(x.net)}</td><td>DPH ${fmtQty(x.vat)} %</td><td class="num">${money(x.vatAmt)}</td></tr>`).join('')}
             <tr><td>Celkem bez DPH</td><td class="num">${money(totalNet)}</td><td>DPH celkem</td><td class="num">${money(totalVat)}</td></tr>
-            <tr class="inv-sum"><td colspan="3">Celkem k úhradě</td><td class="num">${money(round2(totalNet + totalVat))}</td></tr>
+            <tr class="inv-sum"><td colspan="3">Celkem k úhradě</td><td class="num">${money(total)}</td></tr>
           </table>
         </div>
+        ${qr.svg ? `<div class="inv-pay">
+          <div class="inv-qr"><div class="inv-qr-code">${qr.svg}</div><div class="inv-qr-lbl">${esc(qr.label)}</div></div>
+          <table class="inv-meta"><tr><td>Částka k úhradě</td><td><strong>${money(total)}</strong></td></tr><tr><td>IBAN</td><td>${esc(PayQR.fmtIban(qr.iban))}</td></tr>${cfg.bic ? `<tr><td>BIC / SWIFT</td><td>${esc(cfg.bic.toUpperCase())}</td></tr>` : ''}<tr><td>Variabilní symbol</td><td>${esc(vs)}</td></tr><tr><td>Splatnost</td><td>${fmtDay(due)}</td></tr>
+            <tr><td colspan="2" class="small" style="white-space:normal;color:#444;padding-top:4px">${wh === 'SK' ? 'Zaplaťte naskenovaním QR kódu v mobilnej aplikácii svojej banky.' : 'Zaplaťte naskenováním QR kódu v mobilní aplikaci své banky.'}</td></tr></table>
+        </div>` : ''}
         ${o.invoiceNote ? `<div class="inv-note">${esc(o.invoiceNote)}</div>` : ''}
         <div class="inv-foot">${esc(cfg.footer || '')}${o.preparedBy ? `<div class="small muted">Vystavil: ${esc(o.preparedBy)}${o.preparedAt ? ' · ' + fmtDate(o.preparedAt) : ''}</div>` : ''}</div>
       </div>
@@ -1647,13 +1969,91 @@
     $('#invBilling', el).onclick = async () => { if (await billingDialog(o)) render(); };
   };
 
+  // ---------- Dodací list ke každé připravené objednávce ----------
+  /** Číslo dodacího listu se přidělí při „Ukončeno – připraveno“; každý sklad má vlastní řadu (DL-CZ-…, DL-SK-…). */
+  async function assignDeliveryNo(o) {
+    if (o.deliveryNo) return;
+    const key = `deliverySeq_${o.wh}`; const seq = (state.settings[key] || 0) + 1; await setSetting(key, seq);
+    o.deliveryNo = `DL-${o.wh}-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`; o.deliveryAt = Date.now();
+  }
+  /** Řádky dodacího listu: vydané množství, váhy kusů a skutečně vydané šarže (z výdejky objednávky). */
+  function deliveryLines(o) {
+    const m = o.movementId ? state.movements.find(x => x.id === o.movementId) : null;
+    const picked = o.items.filter(i => i.picked != null && i.picked > 0);
+    return (picked.length ? picked : o.items).map(i => {
+      const p = i.productId ? productById(i.productId) : null;
+      const line = m && m.items.find(l => l.orderItemId === i.id);
+      const lots = {};
+      (line && line.batches || []).forEach(b => { const k = (b.useBy || '') + '|' + (b.lotNo || ''); lots[k] = lots[k] || { useBy: b.useBy || null, lotNo: b.lotNo || null, qty: 0 }; lots[k].qty = round3(lots[k].qty + b.qty); });
+      let lotList = Object.values(lots).filter(l => l.useBy || l.lotNo);
+      if (!lotList.length && i.pickedLots && i.pickedLots.some(Boolean)) lotList = i.pickedLots.filter(Boolean).map(u => ({ useBy: u, lotNo: null, qty: null }));
+      const multi = lotList.length > 1;
+      return { name: i.name, code: i.code || (p && p.code) || '', unit: i.unit, qty: i.picked ?? i.qty, kg: lineKg(i.unit, i.picked ?? i.qty, p), ordered: i.qty, picked: i.picked != null, weights: i.weights,
+        lots: lotList.map(l => ({ ...l, qty: multi ? l.qty : null })) };
+    });
+  }
+  /** Hmotnost řádku v kg: kg/g přímo, jinak množství × „Hmotnost 1 ks“ z karty produktu (když je vyplněná). */
+  function lineKg(unit, qty, p) {
+    const q = Number(qty || 0);
+    if (unit === 'kg') return q; if (unit === 'g') return q / 1000;
+    return p && Number(p.weight) > 0 ? q * Number(p.weight) : null;
+  }
+  routes['/dodaci-list'] = async (el, params) => {
+    const o = orderById(params.get('id'));
+    if (!o) { location.hash = '#/objednavky'; return; }
+    if (!o.deliveryNo && (o.status === 'ready' || o.status === 'done')) { await assignDeliveryNo(o); await saveOrder(o); }
+    setTitle(`Dodací list ${o.deliveryNo || o.no}`);
+    const cfg = invoiceCfg(o.wh); const wh = o.wh;
+    const lines = deliveryLines(o);
+    const issue = dayStr(o.deliveryAt || o.preparedAt || Date.now());
+    const kg = round3(lines.reduce((s, l) => s + (l.kg || 0), 0)); const kgAll = lines.every(l => l.kg != null);
+    const pcs = round3(lines.filter(l => !['kg', 'g'].includes(l.unit)).reduce((s, l) => s + Number(l.qty || 0), 0));
+    const notAll = o.items.filter(i => i.picked == null || (i.picked < i.qty));
+    const missingDl = o.items.some(i => i.picked != null) ? o.items.filter(i => i.picked == null || i.picked === 0) : [];
+    el.innerHTML = `
+      ${!cfg.name ? `<div class="card no-print" style="border-color:var(--warn)">⚠️ Chybí údaje dodavatele (název, adresa, IČO…). Doplň je v <a href="#/nastaveni">Nastavení → Fakturace</a> pro ${esc(whName(wh))}.</div>` : ''}
+      ${o.status !== 'ready' && o.status !== 'done' ? '<div class="card no-print" style="border-color:var(--warn)">⚠️ Objednávka ještě není připravená – toto je jen náhled, dodací list dostane číslo při „Ukončeno – připraveno“.</div>' : ''}
+      <div class="invoice dl">
+        <div class="inv-head">
+          <div><div class="inv-title">DODACÍ LIST</div><div class="inv-no">${esc(o.deliveryNo || 'náhled')}</div><div class="small">${whInfo(wh).flag} ${esc(whName(wh))} · objednávka ${esc(o.no)}</div><div class="dl-code"><svg id="dlBarcode"></svg></div></div>
+          <table class="inv-meta"><tr><td>Datum vystavení</td><td>${fmtDay(issue)}</td></tr><tr><td>Datum dodání</td><td>${fmtDay(issue)}</td></tr><tr><td>Objednávka</td><td>${esc(o.no)}</td></tr>${o.invoiceNo ? `<tr><td>Faktura</td><td>${esc(o.invoiceNo)}</td></tr>` : ''}${o.invoiceNote ? `<tr><td>Vaše objednávka</td><td>${esc(o.invoiceNote)}</td></tr>` : ''}</table>
+        </div>
+        <div class="inv-parties">
+          <div class="inv-party"><div class="inv-lbl">Dodavatel</div><strong>${esc(cfg.name || '—')}</strong><div>${esc(cfg.address || '').replace(/\n/g, '<br>')}</div>${cfg.ico ? `<div>IČO: ${esc(cfg.ico)}</div>` : ''}${cfg.dic ? `<div>DIČ / IČ DPH: ${esc(cfg.dic)}</div>` : ''}</div>
+          <div class="inv-party"><div class="inv-lbl">Odběratel / místo dodání</div><strong>${esc(o.customer || '—')}</strong><div>${esc(o.custAddress || '')}</div>${o.custIco ? `<div>IČO: ${esc(o.custIco)}</div>` : ''}${o.custDic ? `<div>DIČ / IČ DPH: ${esc(o.custDic)}</div>` : ''}</div>
+        </div>
+        <table class="inv-table">
+          <tr><th class="num">#</th><th>Položka</th><th>Šarže / trvanlivost</th><th class="num">Dodáno</th></tr>
+          ${lines.map((l, n) => `<tr><td class="num">${n + 1}</td><td>${esc(l.name)}<div class="small muted">${esc(l.code)}${l.weights && l.weights.length > 1 ? ' · váhy kusů: ' + l.weights.map(fmtQty).join(' + ') + ' ' + esc(l.unit) : ''}</div></td>
+            <td class="small">${l.lots.length ? l.lots.map(x => [x.lotNo ? 'LOT ' + esc(x.lotNo) : '', x.useBy ? 'spotřebujte do ' + fmtDay(x.useBy) : '', x.qty != null ? '(' + fmtQty(x.qty) + ' ' + esc(l.unit) + ')' : ''].filter(Boolean).join(' · ')).join('<br>') : '<span class="muted">—</span>'}</td>
+            <td class="num"><strong>${fmtQty(l.qty)} ${esc(l.unit)}</strong>${l.picked && l.qty !== l.ordered ? `<div class="small muted">obj. ${fmtQty(l.ordered)}</div>` : ''}</td></tr>`).join('')}
+        </table>
+        ${missingDl.length ? `<div class="small" style="margin-top:6px">Nedodáno: ${missingDl.map(i => `${esc(i.name)} (obj. ${fmtQty(i.qty)} ${esc(i.unit)})`).join(', ')}</div>` : ''}
+        <div class="inv-totals"><table>
+          <tr><td>Počet položek</td><td class="num">${lines.length}</td></tr>
+          ${pcs ? `<tr><td>Celkem kusů / balení</td><td class="num">${fmtQty(pcs)}</td></tr>` : ''}
+          ${kg ? `<tr><td>${kgAll ? 'Celková hmotnost' : 'Hmotnost (jen položky se známou váhou)'}</td><td class="num">${fmtQty(kg)} kg</td></tr>` : ''}
+        </table></div>
+        <div class="dl-sign">
+          <div><div class="inv-lbl">Předal (dodavatel)</div><div class="dl-name">${esc(o.preparedBy || '')}</div><div class="dl-line">Datum a podpis</div></div>
+          <div><div class="inv-lbl">Převzal (odběratel)</div><div class="dl-name">&nbsp;</div><div class="dl-line">Jméno, datum, podpis a razítko</div></div>
+        </div>
+        <div class="inv-foot">Zboží převzato v pořádku, v uvedeném množství a bez viditelného poškození.${o.preparedBy ? `<div class="small muted">Vychystal: ${esc(o.preparedBy)}${o.preparedAt ? ' · ' + fmtDate(o.preparedAt) : ''}</div>` : ''}</div>
+      </div>
+      <div class="row no-print" style="margin-top:14px"><button class="btn" id="dlPrint">🖨 Tisknout / uložit PDF</button><button class="btn secondary" id="dlBilling">✏️ Údaje odběratele</button><a class="btn secondary" href="#/objednavka?id=${o.id}">← Zpět na objednávku</a></div>
+      <p class="muted small no-print">Dodací list je bez cen. Vytiskni ho 2× – jeden podepsaný zůstává u vás, druhý dostane odběratel.${notAll.length && (o.status === 'ready' || o.status === 'done') ? ` Pozor: některé položky nebyly dodány v plném objednaném množství.` : ''}</p>`;
+    drawBarcode($('#dlBarcode', el), o.no);
+    $('#dlPrint', el).onclick = () => window.print();
+    $('#dlBilling', el).onclick = async () => { if (await billingDialog(o)) render(); };
+  };
+
   // ---------- Historie ----------
   let histFilter = 'all', histWh = 'all';
   routes['/historie'] = async (el) => {
     setTitle('Historie');
     const list = state.movements.filter(m => (histFilter === 'all' || m.type === histFilter) && (histWh === 'all' || m.wh === histWh || m.whTo === histWh));
     el.innerHTML = `
-      <div class="chips">${[['all', 'Vše'], ['receipt', 'Příjmy'], ['issue', 'Výdeje'], ['transfer', 'Přesuny'], ['inventory', 'Inventury'], ['adjust', 'Korekce']].map(([k, l]) => `<span class="chip ${histFilter === k ? 'active' : ''}" data-f="${k}">${l}</span>`).join('')}
+      <div class="chips">${[['all', 'Vše'], ['receipt', 'Příjmy'], ['issue', 'Výdeje'], ['transfer', 'Přesuny'], ['inventory', 'Inventury'], ['adjust', 'Korekce'], ['damage', 'Škody']].map(([k, l]) => `<span class="chip ${histFilter === k ? 'active' : ''}" data-f="${k}">${l}</span>`).join('')}
         <span class="grow"></span>${[['all', 'Oba sklady'], ...WAREHOUSES.map(w => [w.id, `${w.flag} ${w.id}`])].map(([k, l]) => `<span class="chip ${histWh === k ? 'active' : ''}" data-wh="${k}">${l}</span>`).join('')}</div>
       ${list.length ? `<div class="table-wrap card" style="padding:0"><table>
         <tr><th>Datum</th><th>Doklad</th><th>Typ</th><th>Sklad</th><th>Partner / pozn.</th><th class="num">Položek</th><th class="num">Množství</th></tr>
@@ -1673,8 +2073,16 @@
         <tr><th>Produkt</th><th class="num">Před</th><th class="num">Změna</th><th class="num">Po</th></tr>
         ${m.items.map(i => `<tr><td><div>${esc(i.name)}</div><div class="muted mono small">${esc(i.code)}</div>${lineInfo(i) ? `<div class="muted small">${esc(lineInfo(i))}</div>` : ''}</td><td class="num">${fmtQty(i.before)}</td><td class="num ${i.diff >= 0 ? 'diff-pos' : 'diff-neg'}">${i.diff >= 0 ? '+' : ''}${fmtQty(i.diff)} ${esc(i.unit || '')}</td><td class="num">${fmtQty(i.after)}</td></tr>`).join('')}
       </table></div>
+      ${m.type === 'damage' ? `<div class="dmg-detail">${m.items.map((i, idx) => `<div class="dmg-line">${reasonBadge(i.reason)} <strong>${esc(i.name)}</strong>${i.note ? ` · 📝 ${esc(i.note)}` : ''}${i.photoId ? `<div><img class="dmg-photo" data-photo="${esc(i.photoId)}" data-idx="${idx}" alt="načítám fotku…"></div>` : ''}</div>`).join('')}
+        ${m.receiptDocNo ? `<p class="small muted">Poškozeno při příjmu <a href="#" id="mvRcpt">${esc(m.receiptDocNo)}</a>${m.partner ? ' · dodavatel ' + esc(m.partner) : ''}</p>` : ''}</div>` : ''}
+      ${(() => { const d = m.type === 'receipt' && state.movements.find(x => x.receiptId === m.id); return d ? `<p class="small"><span class="badge danger">⚠️ Škoda</span> Z této dodávky odepsáno jako poškozené: <a href="#" id="mvDmg" data-id="${d.id}">${esc(d.docNo)}</a></p>` : ''; })()}
       <div class="row" style="justify-content:flex-end;margin-top:12px"><button class="btn secondary" id="mvCsv">⬇ CSV</button><button class="btn" data-close>Zavřít</button></div>`, {
-      onOpen(card) { $('#mvCsv', card).onclick = () => downloadText(`${m.docNo}.csv`, toCsv([['Doklad', 'Datum', 'Typ', 'Sklad', 'Do skladu', 'Kód', 'Produkt', 'Jednotka', 'Před', 'Změna', 'Po'], ...m.items.map(i => [m.docNo, fmtDate(m.ts), TYPE_LABEL[m.type], m.wh || '', m.whTo || '', i.code, i.name, i.unit || '', i.before, i.diff, i.after])])); }
+      onOpen(card, close) {
+        $$('[data-photo]', card).forEach(async img => { const src = await loadPhoto(img.dataset.photo); if (src) { img.src = src; img.onclick = () => showPhoto(src, m.items[img.dataset.idx].name); } else img.alt = 'fotka není k dispozici'; });
+        const rc = $('#mvRcpt', card); if (rc) rc.onclick = (e) => { e.preventDefault(); close(null); showMovement(m.receiptId); };
+        const dl = $('#mvDmg', card); if (dl) dl.onclick = (e) => { e.preventDefault(); close(null); showMovement(dl.dataset.id); };
+        $('#mvCsv', card).onclick = () => downloadText(`${m.docNo}.csv`, toCsv([['Doklad', 'Datum', 'Typ', 'Sklad', 'Do skladu', 'Kód', 'Produkt', 'Jednotka', 'Před', 'Změna', 'Po'], ...m.items.map(i => [m.docNo, fmtDate(m.ts), TYPE_LABEL[m.type], m.wh || '', m.whTo || '', i.code, i.name, i.unit || '', i.before, i.diff, i.after])]));
+      }
     });
   }
 
@@ -1732,7 +2140,9 @@
             <div class="field"><label>Adresa</label><input data-inv="${w.id}.address" value="${esc(c.address || '')}" placeholder="Ulice 1, 110 00 Praha"></div>
             <div class="field"><label>IČO</label><input data-inv="${w.id}.ico" value="${esc(c.ico || '')}"></div>
             <div class="field"><label>DIČ / IČ DPH</label><input data-inv="${w.id}.dic" value="${esc(c.dic || '')}"></div>
-            <div class="field"><label>Bankovní účet / IBAN</label><input data-inv="${w.id}.bank" value="${esc(c.bank || '')}"></div>
+            <div class="field"><label>Bankovní účet (jak se tiskne na fakturu)</label><input data-inv="${w.id}.bank" value="${esc(c.bank || '')}" placeholder="${w.id === 'SK' ? 'např. 1234567890/1100' : 'např. 123456789/0800'}"></div>
+            <div class="field"><label>IBAN – pro ${w.id === 'SK' ? 'PAY by square' : 'QR Platbu'} na faktuře</label><input data-inv="${w.id}.iban" value="${esc(c.iban || '')}" placeholder="${w.id === 'SK' ? 'SK.. .... .... .... .... ....' : 'CZ.. .... .... .... .... ....'}" autocapitalize="characters"><div class="small" data-ibanhint="${w.id}"></div></div>
+            <div class="field"><label>BIC / SWIFT (nepovinné)</label><input data-inv="${w.id}.bic" value="${esc(c.bic || '')}" placeholder="např. ${w.id === 'SK' ? 'TATRSKBX' : 'GIBACZPX'}" autocapitalize="characters"></div>
             <div class="field"><label>Výchozí DPH (%) – když ji produkt nemá</label><input data-inv="${w.id}.vat" type="number" step="any" min="0" max="100" value="${esc(c.vat ?? '')}" placeholder="0"></div>
             <div class="field"><label>Splatnost (dní)</label><input data-inv="${w.id}.dueDays" type="number" min="0" value="${esc(c.dueDays ?? 14)}"></div>
             <div class="field"><label>Text na konci faktury</label><input data-inv="${w.id}.footer" value="${esc(c.footer || '')}" placeholder="např. Děkujeme za objednávku."></div>
@@ -1786,7 +2196,7 @@
       const code = cleanScan(raw); const g = gs1Of(code); const hit = lookupCode(code);
       $('#scanTestOut').textContent = [`Kód: ${code}`,
         g ? `GS1: ${g.gtin ? 'GTIN ' + g.gtin : ''}${g.sscc ? ' SSCC ' + g.sscc : ''}${g.useBy ? ' · trvanlivost ' + fmtDay(g.useBy) : ''}${g.prodDate ? ' · výroba ' + fmtDay(g.prodDate) : ''}${g.lot ? ' · šarže ' + g.lot : ''}${g.netKg ? ' · ' + fmtQty(g.netKg) + ' kg' : ''}${g.count ? ' · počet ' + g.count : ''}` : 'GS1: ne (obyčejný kód)',
-        hit ? `Produkt: ${hit.p.name}${hit.pack ? ' · ' + packLabel(hit.p, hit.pack) : ''}${gs1Qty(hit) ? ' · množství ' + fmtQty(gs1Qty(hit)) + ' ' + hit.p.unit : ''}` : 'Produkt: nenalezen'].join('\n');
+        g && g.sscc && !g.gtin ? ssccMessage(g, code) : hit ? `Produkt: ${hit.p.name}${hit.pack ? ' · ' + packLabel(hit.p, hit.pack) : ''}${gs1Qty(hit) ? ' · množství ' + fmtQty(gs1Qty(hit)) + ' ' + hit.p.unit : ''}` : 'Produkt: nenalezen'].join('\n');
     };
     $('#scanTestBtn').onclick = () => { const v = $('#scanTest').value; if (v.trim()) showScanTest(v); };
     $('#scanTest').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#scanTestBtn').click(); } };
@@ -1794,8 +2204,17 @@
     $('#invSave').onclick = async () => {
       const inv = JSON.parse(JSON.stringify(state.settings.invoice || {}));
       $$('[data-inv]', el).forEach(i => { const [w, k] = i.dataset.inv.split('.'); inv[w] = inv[w] || {}; inv[w][k] = i.value.trim(); });
-      await setSetting('invoice', inv); toast('Fakturační údaje uloženy');
+      await setSetting('invoice', inv); toast('Fakturační údaje uloženy'); ibanHints();
     };
+    // Kontrola IBAN pro QR platbu přímo v nastavení (IBAN se případně dopočítá z čísla účtu).
+    const ibanHints = () => WAREHOUSES.forEach(w => {
+      const h = $(`[data-ibanhint="${w.id}"]`, el); if (!h) return;
+      const iban = PayQR.resolveIban({ iban: $(`[data-inv="${w.id}.iban"]`, el).value, bank: $(`[data-inv="${w.id}.bank"]`, el).value }, w.id);
+      h.innerHTML = !iban ? '<span class="muted">Bez IBAN nebude na fakturách QR kód pro platbu.</span>'
+        : PayQR.ibanValid(iban) ? `<span style="color:var(--ok)">✓ QR platba na účet ${esc(PayQR.fmtIban(iban))}</span>`
+        : '<span style="color:var(--danger)">✖ IBAN není platný – zkontroluj ho</span>';
+    });
+    $$('[data-inv$=".iban"], [data-inv$=".bank"]', el).forEach(i => i.addEventListener('input', ibanHints)); ibanHints();
     $('#setTheme').onchange = (e) => { const v = e.target.value; if (v === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = v; try { localStorage.setItem('theme', v); } catch (_) {} };
     $('#setDefQty').onchange = (e) => setSetting('defaultQty', Number(e.target.value) || 1);
 
@@ -1877,10 +2296,380 @@
     };
   };
 
+  // ---------- Slepý příjem palet ----------
+  /* Kancl zadá na PC, co přijelo (dodavatel, zboží, kolik kartonů / kusů má být). Skladník v mobilu vidí jen
+   * „nová paleta – zboží X“ BEZ očekávaného počtu, skenuje kartony a na konci ťukne „To je vše“. Teprve pak uvidí
+   * výsledek (sedí / chybí / přebývá); nesedící položku přepočítá. Kancl vidí výsledek, rozdíly i každý přepočet.
+   * Ukládá se do tabulky orders s `kind: 'inbound'` (žádná změna databáze). */
+  const INBOUND_STATUS = { open: 'Čeká na sklad', counting: 'Počítá se', checked: 'Spočítáno', done: 'Naskladněno', cancelled: 'Zrušeno' };
+  const INBOUND_BADGE = { open: 'status-new', counting: 'status-preparing', checked: 'warn', done: 'ok', cancelled: 'neutral' };
+  const inboundById = (id) => state.inbound.find(x => x.id === id);
+  /** „Raclette 400 g, Brie 1 kg“ – co je na paletě (bez počtů). */
+  function inboundTitle(o) {
+    const names = (o.items || []).map(i => { const p = productById(i.productId); return p ? p.name : (i.name || '?'); });
+    return names.length > 2 ? `${names.slice(0, 2).join(', ')} a další (${names.length})` : names.join(', ') || 'zboží';
+  }
+  /** Jednotka očekávaného množství: kartony (balení po N) nebo základní jednotka produktu. */
+  const perLabel = (it, p, n = 2) => it.per === 'pack' ? (n === 1 ? 'karton' : n >= 2 && n <= 4 ? 'kartony' : 'kartonů') : (p ? p.unit : 'ks');
+  const fmtPer = (n, it, p) => `${fmtQty(n)} ${perLabel(it, p, Math.abs(n))}`;
+  /** Kolik je napočítáno u produktu – v kartonech (když kancl zadal kartony), jinak v jednotkách produktu. */
+  function countedOf(o, productId, per) {
+    const sc = (o.scans || []).filter(s => s.productId === productId);
+    return round3(sc.reduce((sum, s) => sum + Number(per === 'pack' ? s.cartons || 0 : s.units || 0), 0));
+  }
+  /** Výsledek kontroly: položky z avíza + zboží navíc, které na paletě být nemělo. */
+  function inboundResult(o) {
+    const lines = (o.items || []).map(it => {
+      const counted = countedOf(o, it.productId, it.per); const diff = round3(counted - Number(it.expected || 0));
+      return { itemId: it.id, productId: it.productId, per: it.per, expected: Number(it.expected || 0), counted, diff };
+    });
+    const extra = [...new Set((o.scans || []).map(s => s.productId))].filter(pid => !(o.items || []).some(i => i.productId === pid));
+    extra.forEach(pid => {
+      const sc = o.scans.filter(s => s.productId === pid); const per = sc.some(s => s.cartons) ? 'pack' : 'unit';
+      const counted = countedOf(o, pid, per); lines.push({ itemId: null, productId: pid, per, expected: 0, counted, diff: counted, extra: true });
+    });
+    return { lines, ok: lines.every(l => l.diff === 0) };
+  }
+  const diffText = (l, p) => l.diff === 0 ? '✅ Sedí' : l.diff < 0 ? `❌ Chybí ${fmtPer(-l.diff, l, p)}` : `⚠️ Přebývá ${fmtPer(l.diff, l, p)}`;
+  const diffClass = (l) => l.diff === 0 ? 'ok' : l.diff < 0 ? 'danger' : 'warn';
+  /** Uložení z mobilu: vezme poslední verzi z databáze (kancl mohl mezitím upravit avízo) a zapíše jen to, co mění sklad. */
+  let inboundSaveChain = Promise.resolve();
+  function saveInboundCount(o) {
+    const run = async () => {
+      const latest = (await DB.get('orders', o.id)) || o;
+      if (latest.status === 'cancelled') { o.status = 'cancelled'; return; }
+      const merged = { ...latest, scans: o.scans || [], pallets: o.pallets || [], checks: o.checks || [], recounts: o.recounts || [], status: o.status, recount: o.recount || null,
+        countBy: o.countBy || null, countStartedAt: o.countStartedAt || null, movementId: o.movementId || null, receivedAt: o.receivedAt || null, receivedBy: o.receivedBy || null, updatedAt: Date.now() };
+      await DB.put('orders', merged);
+      o.items = merged.items; o.supplier = merged.supplier; o.note = merged.note;
+    };
+    inboundSaveChain = inboundSaveChain.then(run, run);
+    return inboundSaveChain;
+  }
+  /** Sériové kartony (01+21) a palety (SSCC) se smí započítat jen jednou – ani znovu v jiném příjmu. */
+  const serialKeyOf = (g) => g ? (g.gtin && g.serial ? `${g.gtin}/${g.serial}` : g.sscc ? `sscc:${g.sscc}` : null) : null;
+  function serialUsedElsewhere(key, selfId) {
+    for (const x of state.inbound) {
+      if (x.id === selfId || x.status === 'cancelled') continue;
+      if ((x.scans || []).some(s => s.key === key) || (x.pallets || []).some(sc => `sscc:${sc}` === key)) return x;
+    }
+    return null;
+  }
+
+  /** Formulář avíza palety (kancl na PC). */
+  async function inboundForm(order = null) {
+    let o = order ? JSON.parse(JSON.stringify(order)) : { id: uid(), kind: 'inbound', no: '', ts: Date.now(), status: 'open', supplier: '', note: '', items: [], scans: [], pallets: [], checks: [], createdBy: state.user, wh: state.wh };
+    const locked = o.status !== 'open'; // už se počítá → sklad nejde měnit
+    const suppliers = [...new Set([...state.inbound.map(x => x.supplier), ...state.products.map(p => p.supplier), ...state.movements.filter(m => m.type === 'receipt').map(m => m.partner)].filter(Boolean))].sort((a, b) => a.localeCompare(b, 'cs'));
+    return new Promise((resolve) => {
+      dialog(`
+        <div class="modal-head"><strong>${order ? `Upravit paletu ${esc(o.no)}` : '📦 Nová paleta k příjmu'}</strong><button class="iconbtn" data-close>✕</button></div>
+        <p class="muted small" style="margin-top:0">Skladník v mobilu uvidí jen <strong>co</strong> na paletě je, ne <strong>kolik</strong>. Spočítá kartony skenem a teprve na konci uvidí, jestli to sedí.</p>
+        <div class="grid2">
+          <div class="field"><label>Sklad</label><select id="ifWh" ${locked ? 'disabled' : ''}>${WAREHOUSES.map(w => `<option value="${w.id}" ${w.id === o.wh ? 'selected' : ''}>${w.flag} ${esc(w.name)}</option>`).join('')}</select></div>
+          <div class="field"><label>Dodavatel</label><input id="ifSupplier" list="supList" value="${esc(o.supplier || '')}" placeholder="např. Entremont" autocomplete="off"><datalist id="supList">${suppliers.map(c => `<option value="${esc(c)}">`).join('')}</datalist></div>
+        </div>
+        <div class="field"><label>Poznámka / číslo dodacího listu</label><input id="ifNote" value="${esc(o.note || '')}" placeholder="volitelné"></div>
+        <label>Zboží na paletě a kolik ho má být</label>
+        <div id="ifItems" class="list" style="margin-top:6px"></div>
+        <div class="row" style="margin-top:8px"><button type="button" class="btn secondary" id="ifAdd">＋ Přidat zboží</button></div>
+        <div class="row" style="justify-content:flex-end;margin-top:14px"><button type="button" class="btn secondary" data-close>Zrušit</button><button type="button" class="btn" id="ifSave">Uložit a poslat do skladu</button></div>`, {
+        onOpen(card, close) {
+          const draw = () => {
+            $('#ifItems', card).innerHTML = o.items.length ? o.items.map((it, i) => {
+              const p = productById(it.productId); const packs = (p && p.packs || []).filter(k => Number(k.qty) > 1);
+              const opts = [...packs.map(k => `<option value="pack:${esc(k.qty)}" ${it.per === 'pack' && Number(it.packQty) === Number(k.qty) ? 'selected' : ''}>kartonů (po ${fmtQty(k.qty)} ${esc(p.unit)})</option>`),
+                `<option value="pack:" ${it.per === 'pack' && !packs.some(k => Number(k.qty) === Number(it.packQty)) ? 'selected' : ''}>kartonů</option>`,
+                `<option value="unit" ${it.per === 'unit' ? 'selected' : ''}>${esc(p ? p.unit : 'ks')}</option>`].join('');
+              return `<div class="item inb-form-row"><div class="grow"><div class="name">${esc(p ? p.name : it.name || '?')}</div><div class="code mono">${esc(p ? p.code : '')}</div></div>
+                <input type="number" min="0" step="any" inputmode="decimal" data-iq="${i}" value="${esc(it.expected ?? '')}" placeholder="počet" style="width:90px">
+                <select data-iu="${i}">${opts}</select><button type="button" class="iconbtn" data-idel="${i}" title="Odebrat">🗑</button></div>`;
+            }).join('') : '<div class="muted small">Zatím nic. Přidej zboží, které na paletě přijelo.</div>';
+            $$('[data-iq]', card).forEach(inp => inp.oninput = () => { o.items[inp.dataset.iq].expected = inp.value; });
+            $$('[data-iu]', card).forEach(sel => sel.onchange = () => { const it = o.items[sel.dataset.iu]; const [per, q] = sel.value.split(':'); it.per = per; it.packQty = per === 'pack' && q ? Number(q) : null; });
+            $$('[data-idel]', card).forEach(b => b.onclick = () => { o.items.splice(Number(b.dataset.idel), 1); draw(); });
+          };
+          draw();
+          $('#ifAdd', card).onclick = async () => {
+            const p = await pickProduct(); if (!p) return;
+            if (o.items.some(i => i.productId === p.id)) { toast('Tohle zboží už v seznamu je'); return; }
+            const pack = (p.packs || []).find(k => Number(k.qty) > 1);
+            o.items.push({ id: uid(), productId: p.id, expected: '', per: pack ? 'pack' : 'unit', packQty: pack ? Number(pack.qty) : null });
+            if (!$('#ifSupplier', card).value && p.supplier) $('#ifSupplier', card).value = p.supplier;
+            draw(); const q = $(`[data-iq="${o.items.length - 1}"]`, card); if (q) q.focus();
+          };
+          $('#ifSave', card).onclick = async () => {
+            o.items.forEach(it => { it.expected = Number(String(it.expected).replace(',', '.')); });
+            if (!o.items.length) return toast('Přidej aspoň jedno zboží');
+            const bad = o.items.find(it => !(it.expected > 0)); if (bad) return toast(`U zboží „${(productById(bad.productId) || {}).name || ''}“ chybí počet`);
+            o.supplier = $('#ifSupplier', card).value.trim(); o.note = $('#ifNote', card).value.trim();
+            if (!locked) o.wh = $('#ifWh', card).value;
+            if (!o.no) o.no = await nextDocNo('inbound', o.wh);
+            // Kancl mění jen avízo – napočítané kartony ze skladu zůstanou (vezmou se z databáze).
+            const latest = order ? await DB.get('orders', o.id) : null;
+            const save = latest ? { ...latest, items: o.items, supplier: o.supplier, note: o.note, wh: o.wh, updatedAt: Date.now() } : { ...o, updatedAt: Date.now() };
+            await DB.put('orders', save); await loadAll();
+            close(null); resolve(inboundById(o.id));
+          };
+        }
+      }).then(r => { if (r === null) resolve(null); });
+    });
+  }
+
+  /** Karta „Palety k přepočítání“ v Příjmu (mobil) – bez očekávaných počtů. */
+  function inboundWaitingHtml() {
+    const list = state.inbound.filter(x => x.wh === state.wh && ['open', 'counting', 'checked'].includes(x.status));
+    if (!list.length) return '';
+    return `<div class="card inb-wait"><h2>📦 Palety k přepočítání (slepý příjem)</h2><div class="list">${list.map(x => `<div class="item clickable" data-count="${x.id}">
+      <div class="grow"><div class="name">Nová paleta – ${esc(inboundTitle(x))}</div><div class="code">${esc(x.supplier || 'dodavatel neuveden')} · ${esc(x.no)}${x.countBy && x.status !== 'open' ? ' · počítá ' + esc(x.countBy) : ''}</div></div>
+      <span class="badge ${INBOUND_BADGE[x.status]}">${INBOUND_STATUS[x.status]}</span></div>`).join('')}</div></div>`;
+  }
+
+  // Kancl: seznam palet a jejich výsledek
+  let inboundFilter = 'open';
+  routes['/palety'] = async (el) => {
+    setTitle('Slepý příjem palet');
+    const list = state.inbound.filter(x => inboundFilter === 'all' || (inboundFilter === 'open' ? ['open', 'counting', 'checked'].includes(x.status) : x.status === inboundFilter));
+    el.innerHTML = `
+      <div class="row between" style="margin-bottom:12px">
+        <div class="chips" style="margin:0">${[['open', 'Rozpracované'], ['done', 'Naskladněné'], ['all', 'Vše']].map(([k, l]) => `<span class="chip ${inboundFilter === k ? 'active' : ''}" data-f="${k}">${l}</span>`).join('')}</div>
+        <button class="btn" id="inbNew">＋ Nová paleta k příjmu</button>
+      </div>
+      <p class="muted small">Kancl zadá, co přijelo a kolik toho má být. Skladník v mobilu (Příjem) vidí jen zboží, počet ne – spočítá ho skenem a pak uvidí, jestli to sedí. Tady vidíš výsledek a rozdíly.</p>
+      ${list.length ? `<div class="list">${list.map(x => { const r = (x.status === 'checked' || x.status === 'done') ? inboundResult(x) : null; return `<div class="item clickable" data-iid="${x.id}">
+        <div class="grow"><div class="name">${esc(x.no)} · ${esc(inboundTitle(x))}</div>
+          <div class="code">${whBadge(x.wh)} ${esc(x.supplier || 'bez dodavatele')} · ${fmtDate(x.ts)}${x.note ? ' · ' + esc(x.note) : ''}</div></div>
+        ${r ? `<span class="badge ${r.ok ? 'ok' : 'danger'}">${r.ok ? 'sedí' : 'rozdíl'}</span>` : ''}<span class="badge ${INBOUND_BADGE[x.status]}">${INBOUND_STATUS[x.status]}</span></div>`; }).join('')}</div>`
+        : '<div class="empty"><div class="big">📦</div>Žádné palety.</div>'}`;
+    $$('.chip', el).forEach(c => c.onclick = () => { inboundFilter = c.dataset.f; render(); });
+    $('#inbNew').onclick = async () => { const x = await inboundForm(); if (x) location.hash = `#/paleta?id=${x.id}`; };
+    $$('[data-iid]', el).forEach(d => d.onclick = () => location.hash = `#/paleta?id=${d.dataset.iid}`);
+  };
+
+  routes['/paleta'] = async (el, params) => {
+    const o = inboundById(params.get('id'));
+    if (!o) { location.hash = '#/palety'; return; }
+    setTitle(`Paleta ${o.no}`);
+    const counted = o.status !== 'open';
+    const res = inboundResult(o);
+    const m = o.movementId ? state.movements.find(x => x.id === o.movementId) : null;
+    el.innerHTML = `
+      <div class="card">
+        <div class="row between"><h2>📦 ${esc(o.no)} · ${esc(o.supplier || 'bez dodavatele')}</h2><span class="badge ${INBOUND_BADGE[o.status]}">${INBOUND_STATUS[o.status]}</span></div>
+        <div class="muted small">${whInfo(o.wh).flag} ${esc(whName(o.wh))} · zadáno ${fmtDate(o.ts)}${o.createdBy ? ' · ' + esc(o.createdBy) : ''}${o.note ? ' · ' + esc(o.note) : ''}${o.countBy ? ' · počítal(a) ' + esc(o.countBy) : ''}${(o.pallets || []).length ? ' · paleta SSCC ' + o.pallets.map(esc).join(', ') : ''}</div>
+        ${o.status === 'counting' ? '<p class="pack-note">⏳ Skladník právě počítá. Výsledek se tu objeví, až ťukne „To je vše“.</p>' : ''}
+        <div class="table-wrap" style="margin-top:10px"><table>
+          <tr><th>Zboží</th><th class="num">Má být</th><th class="num">Napočítáno</th><th>Výsledek</th></tr>
+          ${res.lines.map(l => { const p = productById(l.productId); const show = o.status === 'checked' || o.status === 'done'; return `<tr><td><div>${esc(p ? p.name : '?')}${l.extra ? ' <span class="badge warn">není v avízu</span>' : ''}</div><div class="muted mono small">${esc(p ? p.code : '')}</div></td>
+            <td class="num">${l.extra ? '–' : fmtPer(l.expected, l, p)}</td><td class="num">${counted ? fmtPer(l.counted, l, p) : '–'}</td><td>${show ? `<span class="badge ${diffClass(l)}">${diffText(l, p)}</span>` : '<span class="muted small">čeká</span>'}</td></tr>`; }).join('')}
+        </table></div>
+        ${(o.checks || []).length ? `<h3 style="margin-top:14px">Průběh kontroly</h3><div class="list">${o.checks.map((c, i) => `<div class="item"><div class="grow"><div class="name">${i === 0 ? '1. počítání' : `${i + 1}. po přepočítání`} · ${fmtDate(c.ts)}${c.by ? ' · ' + esc(c.by) : ''}</div>
+          <div class="code">${c.lines.map(l => { const p = productById(l.productId); return `${esc(p ? p.name : '?')}: ${l.diff === 0 ? 'sedí' : l.diff < 0 ? 'chybí ' + fmtPer(-l.diff, l, p) : 'přebývá ' + fmtPer(l.diff, l, p)}`; }).join(' · ')}</div></div>
+          <span class="badge ${c.lines.every(l => l.diff === 0) ? 'ok' : 'danger'}">${c.lines.every(l => l.diff === 0) ? 'sedí' : 'rozdíl'}</span></div>`).join('')}</div>` : ''}
+        ${m ? `<p class="small" style="margin-top:12px">✅ Naskladněno dokladem <a href="#" id="inbMv" class="mono">${esc(m.docNo)}</a> · ${fmtDate(m.ts)}${o.receivedBy ? ' · ' + esc(o.receivedBy) : ''} (napočítané množství)</p>` : ''}
+        <div class="row" style="margin-top:14px">
+          ${o.status !== 'done' && o.status !== 'cancelled' ? '<button class="btn secondary" id="inbEdit">✏️ Upravit avízo</button><a class="btn secondary" href="#/pocitat?id=' + o.id + '">📱 Otevřít počítání</a>' : ''}
+          ${o.status === 'open' ? '<button class="btn danger" id="inbDel">Smazat</button>' : o.status !== 'done' && o.status !== 'cancelled' ? '<button class="btn danger" id="inbCancel">Zrušit</button>' : ''}
+          <span class="grow"></span><a class="btn secondary" href="#/palety">← Zpět</a>
+        </div>
+      </div>`;
+    const ed = $('#inbEdit'); if (ed) ed.onclick = async () => { await inboundForm(o); render(); };
+    const mv = $('#inbMv'); if (mv) mv.onclick = (e) => { e.preventDefault(); showMovement(m.id); };
+    const del = $('#inbDel'); if (del) del.onclick = async () => { if (await confirmDlg('Smazat paletu', `Smazat avízo ${o.no}?`, 'Smazat', true)) { await DB.del('orders', o.id); await loadAll(); location.hash = '#/palety'; } };
+    const cn = $('#inbCancel'); if (cn) cn.onclick = async () => { if (await confirmDlg('Zrušit paletu', `Zrušit příjem ${o.no}? Nic se nenaskladní, napočítané kartony zůstanou v záznamu.`, 'Zrušit příjem', true)) { const latest = await DB.get('orders', o.id); await DB.put('orders', { ...latest, status: 'cancelled', updatedAt: Date.now() }); await loadAll(); render(); } };
+  };
+
+  // Mobil: slepé počítání palety
+  routes['/pocitat'] = async (el, params) => {
+    const o0 = inboundById(params.get('id'));
+    if (!o0) { location.hash = '#/prijem'; return; }
+    const o = JSON.parse(JSON.stringify(o0)); o.scans = o.scans || []; o.pallets = o.pallets || []; o.checks = o.checks || []; o.recounts = o.recounts || [];
+    setTitle('Slepý příjem');
+    const expectedIds = () => o.items.map(i => i.productId);
+    const say = (msg, ok) => { if (!$('#scanModal').classList.contains('hidden')) scanner.feedback(msg, ok); else { beep(ok); toast(msg, 3500); } };
+    const ownCount = (pid) => { const it = o.items.find(i => i.productId === pid); const per = it ? it.per : (o.scans.some(s => s.productId === pid && s.cartons) ? 'pack' : 'unit'); return { per, n: countedOf(o, pid, per), it }; };
+    const start = () => { if (o.status === 'open') { o.status = 'counting'; o.countBy = state.user; o.countStartedAt = Date.now(); } };
+
+    const addScan = async (code) => {
+      if (o.status === 'done' || o.status === 'cancelled') return say('Tahle paleta je už uzavřená.', false);
+      if (o.status === 'checked' && !o.recount) return say('Paleta je spočítaná – nesedící zboží přepočítej tlačítkem 🔁.', false);
+      const g = gs1Of(code);
+      // Samotné číslo palety (SSCC): uloží se k příjmu, nepočítá se. Stejná paleta nejde načíst dvakrát.
+      if (g && !g.gtin && g.sscc) {
+        if (o.pallets.includes(g.sscc)) return say('Tahle paleta už je načtená.', false);
+        const other = serialUsedElsewhere(`sscc:${g.sscc}`, o.id); const prev = ssccReceipts(g.sscc)[0];
+        if (other || prev) return say(`⛔ Paleta ${g.sscc} už byla přijata (${other ? other.no : prev.docNo}) – nepočítá se znovu.`, false);
+        start(); o.pallets.push(g.sscc); await saveInboundCount(o); draw();
+        return say('📦 Číslo palety uloženo – teď skenuj kartony.', true);
+      }
+      let hit = lookupCode(code);
+      if (!hit) {
+        if (!$('#scanModal').classList.contains('hidden')) { scanner.feedback(`Neznámý kód ${code}`, false); await scanner.close(); }
+        hit = await resolveUnknownCode(code); if (!hit) return;
+      }
+      const p = hit.p;
+      if (g && g.contentGtin && g.count && !g.serial) {
+        // Paletová etiketa s počtem kartonů – počítá se po kartonech, ne podle etikety.
+        if (g.sscc && !o.pallets.includes(g.sscc)) { o.pallets.push(g.sscc); start(); await saveInboundCount(o); draw(); }
+        return say(`Paletová etiketa ${p.name} – nepočítá se. Skenuj jednotlivé kartony.`, false);
+      }
+      if (o.recount && o.recount !== p.id) { const rp = productById(o.recount); return say(`Teď přepočítáváš ${rp ? rp.name : 'jiné zboží'} – ${p.name} se nepočítá.`, false); }
+      const key = serialKeyOf(g);
+      if (key) {
+        if (o.scans.some(s => s.key === key)) return say(`⛔ Tenhle karton (${g.serial ? 'sériové č. ' + g.serial : 'SSCC ' + g.sscc}) už je načtený!`, false);
+        const other = serialUsedElsewhere(key, o.id); if (other) return say(`⛔ Tenhle karton už byl přijat v ${other.no}.`, false);
+      }
+      const it = o.items.find(i => i.productId === p.id);
+      // Karton = kód balení, etiketa GS1 na kartonu, nebo jakýkoli kód zboží, které kancl zadal v kartonech (karton bez vlastního kódu).
+      const isCarton = !!(hit.pack || g || (it && it.per === 'pack'));
+      // Jednotky do příjemky: vážené zboží podle váhy z etikety, karton podle balení (z kódu, nebo jak ho zadal kancl).
+      let units = g && isWeighed(p) && g.netKg ? gs1Qty(hit) : null;
+      if (units == null && hit.pack) units = g ? gs1Qty(hit) : Number(hit.pack.qty);
+      if (units == null && isCarton && it && it.per === 'pack' && it.packQty) units = Number(it.packQty);
+      if (units == null && g) units = gs1Qty(hit);
+      if (units == null && isWeighed(p) && !isCarton) {
+        // Vážené zboží bez váhy v kódu: zapsat váhu (počet se ale neukazuje).
+        if (scanner.running) { scanner.feedback(`✓ ${p.name} – zapiš váhu`, true); await scanner.pause(); }
+        const w = await qtyDialog(p, { title: `Váha: ${p.name}`, defaultQty: '', wh: o.wh });
+        if (scanner.running) await scanner.resume();
+        if (!(w > 0)) return;
+        units = w;
+      }
+      if (units == null) units = hit.pack ? Number(hit.pack.qty) : (it && it.per === 'pack' && it.packQty ? Number(it.packQty) : 1);
+      start();
+      o.scans.push({ id: uid(), ts: Date.now(), by: state.user, productId: p.id, code: g ? g.hri : code, cartons: isCarton ? 1 : 0, units: round3(units),
+        kg: g && g.netKg ? g.netKg : null, useBy: g ? g.useBy || null : null, prodDate: g ? g.prodDate || null : null, lotNo: g ? g.lot || null : null, key });
+      await saveInboundCount(o); draw();
+      const c = ownCount(p.id);
+      say(`${it ? '✓' : '⚠️ Není v avízu –'} ${p.name} · načteno ${fmtPer(c.n, c, p)}`, !!it);
+    };
+    addScan.sscc = true;
+    const addManual = async (pid) => {
+      const p = productById(pid); const c = ownCount(pid);
+      const r = await dialog(`
+        <div class="modal-head"><strong>Ručně: ${esc(p.name)}</strong><button class="iconbtn" data-close>✕</button></div>
+        <p class="muted small" style="margin-top:0">Když kód nejde načíst (poškozená etiketa). Zadej, kolik ${c.per === 'pack' ? 'kartonů' : esc(p.unit)} přidat (záporné číslo ubere).</p>
+        <form><div class="field"><input name="n" type="number" step="any" inputmode="decimal" value="1" required></div>
+        <div class="row" style="justify-content:flex-end"><button type="button" class="btn secondary" data-close>Zrušit</button><button class="btn">Přidat</button></div></form>`);
+      const n = r ? Number(String(r.n).replace(',', '.')) : 0; if (!n) return;
+      start();
+      const packQ = c.it && c.it.packQty ? Number(c.it.packQty) : ((p.packs || []).find(k => Number(k.qty) > 1) || { qty: 1 }).qty;
+      o.scans.push({ id: uid(), ts: Date.now(), by: state.user, productId: pid, code: null, manual: true, cartons: c.per === 'pack' ? n : 0, units: round3(c.per === 'pack' ? n * Number(packQ) : n), key: null });
+      await saveInboundCount(o); draw();
+    };
+
+    const draw = () => {
+      if (o.status === 'checked' && !o.recount) return drawResult();
+      const pids = [...new Set([...expectedIds(), ...o.scans.map(s => s.productId)])].filter(pid => !o.recount || pid === o.recount);
+      const total = o.scans.reduce((s, x) => s + Number(x.cartons || 0), 0);
+      const rp = o.recount && productById(o.recount);
+      el.innerHTML = `
+        <div class="card">
+          <h2>📦 Nová paleta</h2>
+          <div class="muted small">${whInfo(o.wh).flag} ${esc(whName(o.wh))} · ${esc(o.supplier || 'dodavatel neuveden')} · ${esc(o.no)}${o.pallets.length ? ` · 🏷️ ${o.pallets.length === 1 ? 'paleta' : o.pallets.length + ' palety'} načtena` : ''}</div>
+          ${rp ? `<p class="pack-note" style="border-color:var(--warn)">🔁 <strong>Přepočítej: ${esc(rp.name)}</strong> – načti znovu všechny kartony tohoto zboží.</p>`
+            : '<p class="pack-note">Naskenuj každý karton na paletě. Kolik jich má být, uvidíš až na konci po „To je vše“.</p>'}
+          <button class="btn big" id="bcScan" style="width:100%">📷 Skenovat kartony</button>
+        </div>
+        <div class="list">${pids.map(pid => { const p = productById(pid); if (!p) return ''; const c = ownCount(pid); return `<div class="item">
+          <div class="grow"><div class="name">${esc(p.name)}${c.it ? '' : ' <span class="badge warn">není v avízu</span>'}</div><div class="code mono">${esc(p.code)}${p.location ? ' · ' + esc(p.location) : ''}</div></div>
+          <div class="bc-count"><strong>${fmtQty(c.n)}</strong><span class="small muted">${esc(perLabel(c, p, c.n))}</span></div>
+          <button class="btn sm secondary" data-man="${pid}" title="Přidat ručně">＋ ručně</button></div>`; }).join('')}</div>
+        <div class="sticky-actions">
+          <div class="row between" style="margin-bottom:6px"><span class="muted small">Načteno celkem ${fmtQty(total)} ${perLabel({ per: 'pack' }, null, total)}${o.scans.length ? ' · ' + o.scans.length + ' skenů' : ''}</span><button class="btn sm secondary" id="bcUndo" ${o.scans.length ? '' : 'disabled'}>↶ Zpět poslední</button></div>
+          <button class="btn big ok" id="bcDone" ${o.scans.length || o.recount ? '' : 'disabled'}>✋ To je vše</button>
+        </div>`;
+      $('#bcScan').onclick = () => scanner.open(rp ? `Přepočítej: ${rp.name}` : 'Skenuj kartony na paletě', addScan);
+      pageScan = addScan;
+      $$('[data-man]', el).forEach(b => b.onclick = () => addManual(b.dataset.man));
+      $('#bcUndo').onclick = async () => {
+        const last = o.scans[o.scans.length - 1]; if (!last) return; const p = productById(last.productId);
+        if (!await confirmDlg('Vrátit poslední sken', `Odebrat poslední načtený ${p ? p.name : 'kód'}?`, 'Odebrat')) return;
+        o.scans.pop(); await saveInboundCount(o); draw();
+      };
+      $('#bcDone').onclick = async () => {
+        if (!await confirmDlg('To je vše?', rp ? `Máš znovu načtené všechny kartony „${rp.name}“?` : 'Načetl(a) jsi všechny kartony na paletě? Potom uvidíš, jestli počet sedí.', 'Ano, to je vše')) return;
+        const r = inboundResult(o);
+        o.checks.push({ ts: Date.now(), by: state.user, recount: o.recount || null, lines: r.lines.map(l => ({ productId: l.productId, per: l.per, expected: l.expected, counted: l.counted, diff: l.diff })) });
+        o.status = 'checked'; o.recount = null;
+        await saveInboundCount(o); await loadAll(); draw();
+        r.ok ? beep(true) : (beep(false), navigator.vibrate && navigator.vibrate([200, 100, 200]));
+      };
+    };
+
+    const drawResult = () => {
+      pageScan = null;
+      const r = inboundResult(o);
+      el.innerHTML = `
+        <div class="card bc-result ${r.ok ? 'bc-ok' : 'bc-bad'}">
+          <div class="bc-big">${r.ok ? '✅' : '⚠️'}</div>
+          <h2>${r.ok ? 'Všechno sedí' : 'Počet nesedí'}</h2>
+          <div class="muted small">${esc(o.no)} · ${esc(o.supplier || '')}${o.checks.length > 1 ? ` · ${o.checks.length}. kontrola` : ''}</div>
+        </div>
+        <div class="list">${r.lines.map(l => { const p = productById(l.productId); return `<div class="item">
+          <div class="grow"><div class="name">${esc(p ? p.name : '?')}${l.extra ? ' <span class="badge warn">není v avízu</span>' : ''}</div>
+            <div class="code">Napočítáno ${fmtPer(l.counted, l, p)}${l.extra ? '' : ` · má být ${fmtPer(l.expected, l, p)}`}</div>
+            <div class="row" style="margin-top:6px"><span class="badge ${diffClass(l)}" style="font-size:14px">${diffText(l, p)}</span>
+            ${l.diff !== 0 ? `<span class="grow"></span><button class="btn sm" data-recount="${l.productId}">🔁 Přepočítat</button>` : ''}</div></div></div>`; }).join('')}</div>
+        <div class="sticky-actions">
+          ${r.ok ? '' : '<p class="muted small" style="margin:0 0 6px">Nesedící zboží přepočítej. Když i potom nesedí, naskladni napočítané množství – kancl uvidí rozdíl.</p>'}
+          <button class="btn big ok" id="bcReceive">✅ Naskladnit${r.ok ? '' : ' napočítané množství'}</button>
+        </div>`;
+      $$('[data-recount]', el).forEach(b => b.onclick = async () => {
+        const pid = b.dataset.recount; const p = productById(pid);
+        if (!await confirmDlg('Přepočítat', `Načtené kartony „${p ? p.name : ''}“ se vynulují a načteš je znovu.`, '🔁 Přepočítat')) return;
+        o.recounts.push({ ts: Date.now(), by: state.user, productId: pid, scans: o.scans.filter(s => s.productId === pid) });
+        o.scans = o.scans.filter(s => s.productId !== pid); o.recount = pid; o.status = 'counting';
+        await saveInboundCount(o); draw();
+        scanner.open(`Přepočítej: ${p ? p.name : ''}`, addScan);
+      });
+      $('#bcReceive').onclick = () => receive(r);
+    };
+
+    /** Naskladnění: řádky příjemky podle produktu a šarže (z etiket); chybějící trvanlivost jde doplnit. */
+    const receive = async (r) => {
+      const rows = [];
+      for (const s of o.scans) {
+        if (!(Number(s.units) > 0) && !(Number(s.units) < 0)) continue;
+        let row = rows.find(x => x.productId === s.productId && x.useBy === (s.useBy || null) && x.prodDate === (s.prodDate || null) && x.lotNo === (s.lotNo || null));
+        if (!row) { row = { productId: s.productId, qty: 0, useBy: s.useBy || null, prodDate: s.prodDate || null, lotNo: s.lotNo || null }; rows.push(row); }
+        row.qty = round3(row.qty + Number(s.units));
+      }
+      const items = rows.filter(x => x.qty > 0);
+      if (!items.length) { toast('Není co naskladnit – nic není napočítané.'); return; }
+      // Zboží bez trvanlivosti z etikety: zeptat se jednou na produkt (volitelné).
+      const noDate = [...new Set(items.filter(x => !x.useBy).map(x => x.productId))].map(productById).filter(Boolean);
+      if (noDate.length) {
+        const d = await dialog(`
+          <div class="modal-head"><strong>Trvanlivost a šarže</strong><button class="iconbtn" data-close>✕</button></div>
+          <p class="muted small" style="margin-top:0">Etikety neobsahovaly datum. Opiš ho z kartonu (nepovinné).</p>
+          <form>${noDate.map(p => `<div class="card" style="padding:10px;margin-bottom:8px"><strong>${esc(p.name)}</strong>
+            <div class="grid2"><div class="field"><label>Datum výroby</label><input type="date" name="pd_${p.id}" value="${esc(p.lastProdDate || '')}"></div>
+            <div class="field"><label>Spotřebujte do</label><input type="date" name="ub_${p.id}" value="${esc(p.lastUseBy || '')}"></div></div>
+            <div class="field"><label>Šarže / LOT</label><input name="ln_${p.id}" autocomplete="off"></div></div>`).join('')}
+          <div class="row" style="justify-content:flex-end"><button type="button" class="btn secondary" data-close>Zpět</button><button class="btn ok">✅ Naskladnit</button></div></form>`);
+        if (!d) return;
+        items.filter(x => !x.useBy).forEach(x => {
+          const p = productById(x.productId); const pd = d['pd_' + x.productId] || null;
+          x.prodDate = x.prodDate || pd; x.useBy = d['ub_' + x.productId] || (pd && p && p.shelfLifeDays ? addDays(pd, Number(p.shelfLifeDays)) : null); x.lotNo = x.lotNo || (d['ln_' + x.productId] || '').trim() || null;
+        });
+      } else if (!await confirmDlg('Naskladnit', r.ok ? 'Naskladnit napočítané zboží?' : 'Počet nesedí. Naskladnit napočítané množství? Kancl uvidí rozdíl.', 'Naskladnit')) return;
+      if (o.pallets.length) items[0].ssccs = o.pallets.slice();
+      const m = await commitMovement('receipt', items, { partner: o.supplier || '', note: `Slepý příjem ${o.no}${o.note ? ' · ' + o.note : ''}`, wh: o.wh, inboundId: o.id });
+      Object.assign(o, { status: 'done', movementId: m.id, receivedAt: Date.now(), receivedBy: state.user });
+      await saveInboundCount(o); await loadAll();
+      toast(`Naskladněno ${m.docNo}`); location.hash = '#/prijem';
+    };
+
+    draw();
+  };
+
   // ---------- Rychlý sken z horní lišty ----------
   async function quickScanHandle(code) {
     const ord = state.orders.find(x => x.no === code.toUpperCase());
     if (ord) { scanner.feedback(`Objednávka ${ord.no}`, true); await scanner.close(); location.hash = `#/objednavka?id=${ord.id}`; return; }
+    const inb = state.inbound.find(x => x.no === code.toUpperCase());
+    if (inb) { scanner.feedback(`Paleta ${inb.no}`, true); await scanner.close(); location.hash = `#/pocitat?id=${inb.id}`; return; }
     const hit = lookupCode(code); const p = hit && hit.p;
     if (p) { scanner.feedback(p.name, true); await scanner.close(); location.hash = `#/produkt?id=${p.id}`; }
     else { scanner.feedback(`Neznámý kód ${code}`, false); await scanner.close(); const hit = await resolveUnknownCode(code); if (hit) { location.hash = `#/produkt?id=${hit.p.id}`; render(); } }
@@ -1925,7 +2714,10 @@
       // Živé změny z ostatních zařízení: nová objednávka z kanclu se objeví v mobilu hned.
       let timer;
       DB.subscribe((store, row) => {
-        if (store === 'orders' && row.data && row.data.status === 'new' && !state.orders.some(o => o.id === row.id)) {
+        if (store === 'orders' && row.data && row.data.kind === 'inbound' && row.data.status === 'open' && !state.inbound.some(o => o.id === row.id)) {
+          toast(`📦 Nová paleta k příjmu: ${inboundTitle(row.data)}`, 5000); beep(true);
+        }
+        if (store === 'orders' && row.data && row.data.kind !== 'inbound' && row.data.status === 'new' && !state.orders.some(o => o.id === row.id)) {
           toast(`🧾 Nová objednávka ${row.data.no} (${row.data.customer || 'bez odběratele'})`, 5000); beep(true);
         }
         clearTimeout(timer); timer = setTimeout(async () => { await loadAll(); if ($('#dlg').classList.contains('hidden') && $('#scanModal').classList.contains('hidden')) render(); }, 300);
