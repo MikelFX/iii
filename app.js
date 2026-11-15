@@ -24,7 +24,7 @@
   const reasonInfo = (id) => DAMAGE_REASONS.find(r => r.id === id) || { id, icon: '⚠️', label: id || 'neuvedeno' };
   const reasonBadge = (id) => `<span class="badge reason-${esc(id)}">${reasonInfo(id).icon} ${esc(reasonInfo(id).label)}</span>`;
   const UNITS = ['ks', 'kg', 'g', 'l', 'ml', 'bal', 'krt', 'pal', 'm'];
-  const APP_VERSION = '0.11.1';
+  const APP_VERSION = '0.12.1';
 
   let toastTimer;
   function toast(msg, ms = 2200) {
@@ -874,6 +874,7 @@
     const fn = routes[path] || routes['/'];
     if (path !== lastPath) { lastPath = path; window.scrollTo(0, 0); } // nová obrazovka začíná nahoře
     document.body.classList.toggle('print-label', path === '/stitek' || path === '/faktura' || path === '/dodaci-list');
+    document.body.classList.toggle('wide-view', path === '/sklad3d');
     $$('[data-route]').forEach(a => a.classList.toggle('active', a.dataset.route === path));
     $('#sidenav').classList.remove('open'); $('#backdrop').classList.remove('open');
     pageScan = null;
@@ -1805,6 +1806,7 @@
           <span class="badge status-${o.status}" style="font-size:14px">${ORDER_STATUS[o.status]}</span>
         </div>
         ${o.status === 'ready' || o.status === 'done' ? `<div class="muted small" style="margin-top:8px">Připravil ${esc(o.preparedBy || '—')} ${o.preparedAt ? fmtDate(o.preparedAt) : ''}${o.movementId ? ' · výdejka <a href="#" id="ordMv">zobrazit</a>' : ''}${o.deliveryNo ? ' · dodací list ' + esc(o.deliveryNo) : ''}${o.invoiceNo ? ' · faktura ' + esc(o.invoiceNo) : ''}</div>` : ''}
+        ${o.status === 'ready' ? `<div class="slot-line"><span class="slot-badge">📍 ${o.slot ? esc(o.slot) : '—'}</span><span class="grow muted small">${o.slot ? `Paleta stojí na místě <strong>${esc(o.slot)}</strong> (${o.slot[0] === 'P' ? 'přední část' : 'zadní část'} skladu) a čeká na vydání.` : 'Všechna místa jsou obsazená – paleta nemá přidělené místo.'}</span><button class="btn sm secondary" id="ordSlot">Změnit místo</button><a class="btn sm secondary" href="#/sklad3d?id=${o.id}">🏗️ Ukázat ve 3D</a></div>` : ''}
       </div>
       ${editable && o.wh !== state.wh ? `<div class="card" style="border-color:var(--primary)">ℹ️ Objednávka je ze skladu <strong>${whInfo(o.wh).flag} ${esc(whName(o.wh))}</strong>. Vydané zboží se odepíše z tohoto skladu, i když máš v zařízení vybraný ${esc(whName(state.wh))}.</div>` : ''}
       ${o.status === 'ready' || o.status === 'done' ? `<div class="card label-card"><div class="row between"><h2>🏷️ Štítek, dodací list a faktura</h2><div class="row"><a class="btn" href="#/stitek?id=${o.id}">🖨 Štítek na paletu</a><a class="btn secondary" href="#/dodaci-list?id=${o.id}">📄 Dodací list</a><a class="btn secondary" href="#/faktura?id=${o.id}">🧾 Faktura</a></div></div><svg id="ordBarcode"></svg><p class="muted small" style="margin:6px 0 0">Naskenováním štítku (📷 nahoře) se objednávka otevře v mobilu. Dodací list a fakturu vytiskneš z počítače.</p></div>` : ''}
@@ -1846,10 +1848,12 @@
       if (!picked.length) { toast('Nejdřív naskenuj a vydej položky'); return; }
       if (notPicked.length && !await confirmDlg('Ukončit objednávku', `${notPicked.length} položek není vychystaných (${notPicked.map(i => i.name).join(', ')}). Nebudou odepsány ze skladu. Ukončit i tak?`, 'Ukončit')) return;
       o.status = 'ready'; o.preparedBy = state.user; o.preparedAt = Date.now();
+      assignPalletSlot(o);
       await assignDeliveryNo(o); await assignInvoiceNo(o);
-      await saveOrder(o); toast(`${o.no} připraveno – štítek, dodací list i faktura jsou k tisku`); render();
+      await saveOrder(o); toast(o.slot ? `${o.no} připraveno – paletu odlož na místo ${o.slot}` : `${o.no} připraveno – štítek, dodací list i faktura jsou k tisku`, o.slot ? 4500 : 2200); render();
     };
     const dn = $('#ordDone', el); if (dn) dn.onclick = async () => { o.status = 'done'; o.doneAt = Date.now(); await saveOrder(o); render(); };
+    const sl = $('#ordSlot', el); if (sl) sl.onclick = async () => { if (await slotDialog(o)) render(); };
     const cp = $('#ordCopy', el); if (cp) cp.onclick = async () => {
       const items = o.items.map(i => { const c = { ...i, id: uid(), picked: null, pickedAt: null, pickedBy: null, weights: null, manual: false, pickedLots: null }; delete c.lot; return c; });
       const n = await orderForm({ ...o, id: uid(), no: '', ts: Date.now(), status: 'new', items, preparedBy: null, preparedAt: null, movementId: null, doneAt: null, deliveryNo: null, deliveryAt: null, invoiceNo: null, invoiceAt: null, createdBy: state.user });
@@ -1878,6 +1882,151 @@
     drawBarcode($('#lblBarcode', el), o.no);
     $('#lblPrint', el).onclick = () => window.print();
   };
+
+  // ---------- Místa pro připravené palety + 3D přehled pro kancelář ----------
+  /** Přední část P1–P12, zadní Z1–Z15 (stejné jako v sklad3d.js). Hotová objednávka dostane první volné místo. */
+  const PALLET_SLOTS = [...Array.from({ length: 12 }, (_, i) => 'P' + (i + 1)), ...Array.from({ length: 15 }, (_, i) => 'Z' + (i + 1))];
+  const readyOrders = () => state.orders.filter(o => o.status === 'ready').sort((a, b) => (a.preparedAt || a.ts) - (b.preparedAt || b.ts));
+  function usedSlots(exceptId) { return new Set(readyOrders().filter(o => o.id !== exceptId && o.slot).map(o => o.slot)); }
+  function assignPalletSlot(o) {
+    const used = usedSlots(o.id);
+    if (o.slot && PALLET_SLOTS.includes(o.slot) && !used.has(o.slot)) return o.slot;
+    o.slot = PALLET_SLOTS.find(s => !used.has(s)) || null; return o.slot;
+  }
+  /** Připravené objednávky bez místa (nebo se zdvojeným místem) dostanou místo; uloží se jen změněné. */
+  async function ensurePalletSlots() {
+    const taken = new Set(); const changed = [];
+    for (const o of readyOrders()) {
+      if (o.slot && PALLET_SLOTS.includes(o.slot) && !taken.has(o.slot)) { taken.add(o.slot); continue; }
+      const free = PALLET_SLOTS.find(s => !taken.has(s));
+      if ((free || null) !== (o.slot || null)) { o.slot = free || null; changed.push(o); }
+      if (free) taken.add(free);
+    }
+    for (const o of changed) { o.updatedAt = Date.now(); await DB.put('orders', o); }
+    if (changed.length) await loadAll();
+  }
+  async function slotDialog(o) {
+    const used = usedSlots(o.id);
+    const btn = (s) => `<button type="button" class="slot-pick ${s === o.slot ? 'cur' : ''}" data-slot="${s}" ${used.has(s) ? 'disabled title="obsazeno"' : ''}>${s}</button>`;
+    const r = await dialog(`
+      <div class="modal-head"><strong>Místo pro paletu ${esc(o.no)}</strong><button class="iconbtn" data-close>✕</button></div>
+      <p class="muted small" style="margin-top:0">Šedá místa jsou obsazená jinou připravenou objednávkou.</p>
+      <div class="muted small">Přední část</div><div class="slot-grid">${PALLET_SLOTS.filter(s => s[0] === 'P').map(btn).join('')}</div>
+      <div class="muted small" style="margin-top:10px">Zadní část</div><div class="slot-grid">${PALLET_SLOTS.filter(s => s[0] === 'Z').map(btn).join('')}</div>`, {
+      onOpen(card, close) { $$('[data-slot]', card).forEach(b => b.onclick = () => close(b.dataset.slot)); }
+    });
+    if (!r || r === o.slot) return false;
+    if (usedSlots(o.id).has(r)) { toast('Místo je mezitím obsazené'); return false; }
+    o.slot = r; await saveOrder(o); toast(`${o.no} → místo ${r}`); return true;
+  }
+
+  let w3d = null, w3dMod = null, w3dSel = null;
+  const agoText = (ts) => { if (!ts) return ''; const m = Math.round((Date.now() - ts) / 60000); if (m < 1) return 'právě teď'; if (m < 60) return `před ${m} min`; const h = Math.round(m / 60); if (h < 24) return `před ${h} h`; const d = Math.round(h / 24); return `před ${d} ${d === 1 ? 'dnem' : 'dny'}`; };
+  routes['/sklad3d'] = async (el, params) => {
+    setTitle('Sklad 3D');
+    await ensurePalletSlots();
+    const ready = readyOrders();
+    const inFront = ready.filter(o => o.slot && o.slot[0] === 'P').length, inBack = ready.filter(o => o.slot && o.slot[0] === 'Z').length, noSlot = ready.filter(o => !o.slot);
+    if (params.get('id')) w3dSel = params.get('id');
+    if (w3dSel && !ready.some(o => o.id === w3dSel)) w3dSel = null;
+    el.innerHTML = `
+      <div class="w3d">
+        <div class="w3d-stage card" id="w3dStage">
+          <div class="w3d-host" id="w3dHost"><div class="w3d-loading" id="w3dLoading">Načítám 3D sklad…</div></div>
+          <div class="w3d-top">
+            <div class="w3d-stats">
+              <span class="w3d-stat big"><b>${ready.length}</b> čeká na vydání</span>
+              <span class="w3d-stat">Přední část <b>${inFront}</b>/12</span>
+              <span class="w3d-stat">Zadní část <b>${inBack}</b>/15</span>
+            </div>
+            <div class="w3d-views">
+              <button class="w3d-vbtn" data-view="all" title="Celkový pohled">🏭 Celkem</button>
+              <button class="w3d-vbtn" data-view="front" title="Přední část">Přední</button>
+              <button class="w3d-vbtn" data-view="back" title="Zadní část">Zadní</button>
+              <button class="w3d-vbtn" data-view="top" title="Půdorys shora">⬇ Shora</button>
+              <button class="w3d-vbtn" id="w3dFull" title="Celá obrazovka">⛶</button>
+            </div>
+          </div>
+          <div class="w3d-tip" id="w3dTip"></div>
+          <div class="w3d-legend"><span><i class="lg-pal"></i>připravená objednávka</span><span><i class="lg-slot"></i>volné místo</span><span><i class="lg-door"></i>vrata – příjem / výdej</span><span><i class="lg-off"></i>kancelář</span></div>
+          <div class="w3d-help">Táhni myší = otáčení · kolečko = přiblížení · pravé tlačítko = posun · klik na paletu = detail</div>
+        </div>
+        <aside class="w3d-side">
+          <div class="card w3d-detail" id="w3dDetail"></div>
+          <div class="card">
+            <div class="row between"><h2 style="margin:0">Připraveno k vydání</h2><span class="badge status-ready">${ready.length}</span></div>
+            ${noSlot.length ? `<p class="pack-note" style="margin:10px 0 0">⚠️ ${noSlot.length} ${noSlot.length === 1 ? 'objednávka nemá' : 'objednávek nemá'} místo – všech 27 míst je obsazených.</p>` : ''}
+            ${ready.length ? `<div class="list w3d-list">${ready.map(o => `<div class="item clickable ${o.id === w3dSel ? 'sel' : ''}" data-oid="${o.id}">
+              <span class="slot-badge">${o.slot ? esc(o.slot) : '—'}</span>
+              <div class="grow"><div class="name">${esc(o.no)} ${whBadge(o.wh)}</div><div class="code">${esc(o.customer || 'bez odběratele')} · ${agoText(o.preparedAt)}</div></div></div>`).join('')}</div>`
+              : '<p class="muted" style="margin-bottom:0">Žádná objednávka teď nečeká na vydání. Jakmile skladník ťukne „Ukončeno – připraveno“, paleta se tu objeví na svém místě.</p>'}
+          </div>
+        </aside>
+      </div>`;
+    const drawDetail = () => {
+      const box = $('#w3dDetail', el); if (!box) return;
+      const o = w3dSel && orderById(w3dSel);
+      if (!o || o.status !== 'ready') { box.innerHTML = `<div class="muted small">Klikni na paletu ve 3D nebo na objednávku v seznamu.</div>`; box.classList.add('empty'); return; }
+      box.classList.remove('empty');
+      const items = o.items.filter(i => i.picked != null);
+      box.innerHTML = `
+        <div class="row between" style="align-items:flex-start"><div><div class="muted small">Místo</div><div class="w3d-slot-big">${o.slot ? esc(o.slot) : '—'}</div></div>
+          <div style="text-align:right"><div class="w3d-no">${esc(o.no)}</div><div>${whBadge(o.wh)}</div></div></div>
+        <div style="margin:8px 0 2px;font-weight:600">${esc(o.customer || 'bez odběratele')}</div>
+        <div class="muted small">Připravil ${esc(o.preparedBy || '—')} · ${o.preparedAt ? fmtDate(o.preparedAt) : ''} · ${items.length} položek</div>
+        <svg id="w3dBarcode"></svg>
+        <ul class="w3d-items">${(items.length ? items : o.items).slice(0, 6).map(i => `<li><span>${esc(i.name)}</span><b>${fmtQty(i.picked ?? i.qty)} ${esc(i.unit)}</b></li>`).join('')}${o.items.length > 6 ? `<li class="muted">… a dalších ${o.items.length - 6}</li>` : ''}</ul>
+        <div class="row" style="flex-wrap:wrap;gap:6px">
+          <a class="btn sm" href="#/objednavka?id=${o.id}">Otevřít</a>
+          <a class="btn sm secondary" href="#/stitek?id=${o.id}">🖨 Štítek</a>
+          <button class="btn sm secondary" id="w3dMove">📍 Přesunout</button>
+          <button class="btn sm ok" id="w3dDone">🚚 Vydáno</button>
+        </div>`;
+      try { JsBarcode($('#w3dBarcode', box), o.no, { format: 'CODE128', displayValue: false, height: 46, margin: 0, width: 2, background: 'transparent', lineColor: getComputedStyle(document.body).color }); } catch (_) {}
+      $('#w3dMove', box).onclick = async () => { if (await slotDialog(o)) render(); };
+      $('#w3dDone', box).onclick = async () => {
+        if (!await confirmDlg('Vydáno / předáno', `Paleta ${o.no} (${o.customer || 'bez odběratele'}) odjela ze skladu? Zmizí z místa ${o.slot || ''}.`, '🚚 Vydáno')) return;
+        o.status = 'done'; o.doneAt = Date.now(); await saveOrder(o); w3dSel = null; render();
+      };
+    };
+    const selectOrder = (id, fly) => {
+      w3dSel = id; $$('.w3d-list .item', el).forEach(x => x.classList.toggle('sel', x.dataset.oid === id));
+      if (w3d) { w3d.select(id); if (fly && id) w3d.focusOrder(id); }
+      drawDetail();
+    };
+    $$('.w3d-list [data-oid]', el).forEach(x => x.onclick = () => selectOrder(x.dataset.oid, true));
+    drawDetail();
+    // 3D scéna (Three.js) se načte až tady, aby mobil při běžné práci nic navíc nestahoval
+    try {
+      w3dMod = w3dMod || await import('./sklad3d.js');
+      const first = !w3d;
+      if (first) {
+        w3d = w3dMod.createWarehouse3D({
+          onPick: (id) => { const host = $('#w3dHost'); if (host && host.contains(w3d.el)) { selectOrderGlobal(id, false); } },
+          onHover: (id, ev) => {
+            const tip = $('#w3dTip'); if (!tip) return;
+            const o = id && orderById(id);
+            if (!o || !ev) { tip.classList.remove('show'); return; }
+            const r = $('#w3dStage').getBoundingClientRect();
+            tip.innerHTML = `<b>${esc(o.slot || '')} · ${esc(o.no)}</b><br>${esc(o.customer || 'bez odběratele')}<br><span class="muted">${o.items.filter(i => i.picked != null).length} položek · ${agoText(o.preparedAt)}</span>`;
+            tip.style.left = (ev.clientX - r.left + 14) + 'px'; tip.style.top = (ev.clientY - r.top + 14) + 'px'; tip.classList.add('show');
+          },
+        });
+      }
+      selectOrderGlobal = (id, fly) => selectOrder(id, fly);
+      const ld = $('#w3dLoading', el); if (ld) ld.remove();
+      $('#w3dHost', el).appendChild(w3d.el); w3d.start();
+      w3d.setPallets(ready.filter(o => o.slot).map(o => ({ id: o.id, slot: o.slot, no: o.no, customer: o.customer, wh: o.wh, flag: whInfo(o.wh).flag, count: o.items.filter(i => i.picked != null).length || o.items.length, when: o.preparedAt ? new Date(o.preparedAt).toLocaleDateString('cs-CZ') : '', instant: first })));
+      w3d.select(w3dSel);
+      if (params.get('id') && w3dSel) { setTimeout(() => w3d.focusOrder(w3dSel), first ? 300 : 0); history.replaceState(null, '', '#/sklad3d'); }
+      $$('[data-view]', el).forEach(b => b.onclick = () => w3d.view(b.dataset.view));
+      $('#w3dFull', el).onclick = () => { const st = $('#w3dStage', el); if (document.fullscreenElement) document.exitFullscreen(); else if (st.requestFullscreen) st.requestFullscreen(); };
+    } catch (err) {
+      console.error(err);
+      $('#w3dHost', el).innerHTML = `<div class="w3d-loading">3D zobrazení se nepodařilo spustit (${esc(err.message || String(err))}). Zkus jiný prohlížeč (Chrome, Edge) nebo zapni hardwarovou akceleraci.</div>`;
+    }
+  };
+  let selectOrderGlobal = () => {};
 
   // ---------- Faktura ke každé připravené objednávce ----------
   /** Číslo faktury se přidělí při „Ukončeno – připraveno“; každý sklad má vlastní řadu (FA-CZ-…, FA-SK-…). */
