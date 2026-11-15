@@ -22,6 +22,7 @@ Pro mobil: nahrát složku na libovolný HTTPS hosting (GitHub Pages, Netlify, C
 
 - **Dva sklady – CZ a SK** – každý má vlastní stavy, šarže, inventuru i číselnou řadu dokladů. Sklad, ve kterém zařízení pracuje, se přepíná tlačítkem v horní liště. **Přesun CZ ⇄ SK** převede zboží (včetně dat výroby a trvanlivosti) a zapíše se do historie.
 - **Objednávky** – kancl zadá objednávku na PC (s určením skladu a fakturačními údaji odběratele; má-li produkt na skladě víc šarží, vybere se u řádku **trvanlivost**, ze které se vydá – jinak se vydává automaticky nejkratší), skladník ji vychystá skenem na mobilu (u položky vidí, kterou trvanlivost vzít); po „Ukončeno – připraveno“ vznikne štítek na paletu, **dodací list** (číslo DL-CZ-… / DL-SK-…, bez cen, se šaržemi a trvanlivostí, podpisy předal/převzal) a **faktura** (číslo FA-CZ-… / FA-SK-…, ceny bez DPH z karty produktu, DPH, splatnost; údaje dodavatele v Nastavení → Fakturace).
+- **Sklad 3D – palety k vydání** – 3D model skladu pro kancelář (přední část P1–P12, zadní část Z1–Z15, vrata A/B, kancelář). Když skladník ťukne „Ukončeno – připraveno“, objednávka dostane první volné místo a ve 3D se na něm objeví paleta se štítkem a kódem objednávky; po „Vydáno“ zmizí. Místo jde změnit v detailu objednávky nebo ve 3D. Žádné zásoby, jen hotové objednávky. Three.js (MIT) ve `vendor/`.
 - **Produkty** – kód (EAN/čárový kód), název, jednotka, kategorie, minimální zásoba, umístění, dodavatel, cena v Kč a v €, DPH; hledání, filtr, import/export CSV (stavy CZ/SK).
 - **Slepý příjem palet** – kancl na PC zadá, co přijelo (dodavatel, zboží a kolik kartonů / kusů má být). Skladník v mobilu (Příjem → Palety k přepočítání) vidí jen „nová paleta – zboží X“ bez počtu, skenuje kartony (karton s vlastním kódem, etiketa GS1, i obyčejný EAN, když kancl zadal kartony) a ťukne „To je vše“. Teprve pak vidí výsledek: sedí / chybí N / přebývá N, nesedící zboží přepočítá. Sériové kartony (01+21) a palety (SSCC) nejdou načíst dvakrát. Kancl vidí výsledek, rozdíly i průběh přepočítání; naskladní se napočítané množství.
 - **Příjem / Výdej** – skenování kamerou, po načtení kódu zadání množství (např. 150 ks), rozpracovaný doklad přežije zavření appky, kontrola nedostatku zásob, číslované doklady.
@@ -39,6 +40,7 @@ Pro mobil: nahrát složku na libovolný HTTPS hosting (GitHub Pages, Netlify, C
 - `index.html`, `styles.css` – rozložení a vzhled (mobil: spodní lišta, PC: boční menu)
 - `app.js` – logika obrazovek, skener, doklady
 - `db.js` – vrstva nad IndexedDB
+- `sklad3d.js` – 3D přehled připravených palet (načítá se až při otevření obrazovky)
 - `sw.js`, `manifest.json` – offline PWA
 - `gs1.js` – rozbor etiket GS1 (aplikační identifikátory)
 - `vendor/zxing-reader.js`, `vendor/zxing_reader.wasm` – dekodér čárových kódů ZXing-C++ (zxing-wasm 2.2.4, licence MIT/Apache-2.0)
